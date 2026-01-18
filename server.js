@@ -1,6 +1,6 @@
-// server.js (completo y corregido)
+// server.js (Migrado a Supabase)
 const express = require('express');
-const mysql = require('mysql2/promise');
+const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
@@ -17,6 +17,12 @@ cloudinary.config({
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
+
+// Inicializar Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
 
 // Middleware
 app.use(cors());
@@ -35,7 +41,7 @@ app.use('/api', (req, res, next) => {
 const storage = new CloudinaryStorage({
   cloudinary,
   params: {
-    folder: 'news', // carpeta en Cloudinary
+    folder: 'news',
     allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif'],
     public_id: (req, file) => {
       const baseName = file.originalname.split('.')[0].replace(/\s+/g, '-').toLowerCase();
@@ -45,7 +51,6 @@ const storage = new CloudinaryStorage({
   }
 });
 
-// Opcional: fileFilter para asegurar solo imágenes
 const fileFilter = (req, file, cb) => {
   const allowed = /jpeg|jpg|png|gif|webp/;
   const ext = path.extname(file.originalname).toLowerCase();
@@ -57,25 +62,9 @@ const fileFilter = (req, file, cb) => {
 
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter
 });
-
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: 3306,
-  waitForConnections: true,
-  connectionLimit: 5,
-  queueLimit: 0,
-  charset: 'utf8mb4',
-  ssl: {
-    rejectUnauthorized: false
-  }
-});
-
 
 // ==================== NOTICIAS ====================
 
@@ -83,51 +72,51 @@ const pool = mysql.createPool({
 app.get('/api/news', async (req, res) => {
   try {
     const { status, category_id, author_id, is_featured, limit = 50, offset = 0 } = req.query;
-    
-    let query = `
-      SELECT n.*, 
-            a.name AS author_name, 
-            c.name AS category_name,
-            c.slug AS category_slug,
-            (
-              SELECT ni.url 
-              FROM news_images ni 
-              WHERE ni.news_id = n.id 
-              ORDER BY ni.position ASC 
-              LIMIT 1
-            ) AS image_url
-      FROM news n
-      LEFT JOIN authors a ON n.author_id = a.id
-      LEFT JOIN categories c ON n.main_category_id = c.id
-      WHERE 1=1
-    `;
-    let params = [];
+
+    let query = supabase
+      .from('news')
+      .select(`
+        *,
+        authors(name),
+        categories(name, slug),
+        news_images(url, position)
+      `);
 
     if (status) {
-      query += ' AND n.status = ?';
-      params.push(status);
+      query = query.eq('status', status);
     }
     if (category_id) {
-      query += ' AND n.main_category_id = ?';
-      params.push(parseInt(category_id, 10));
+      query = query.eq('main_category_id', parseInt(category_id, 10));
     }
     if (author_id) {
-      query += ' AND n.author_id = ?';
-      params.push(parseInt(author_id, 10));
+      query = query.eq('author_id', parseInt(author_id, 10));
     }
     if (typeof is_featured !== 'undefined') {
-      query += ' AND n.is_featured = ?';
-      params.push(parseInt(is_featured, 10));
+      query = query.eq('is_featured', parseInt(is_featured, 10));
     }
 
     const lim = parseInt(limit, 10) || 50;
     const off = parseInt(offset, 10) || 0;
 
-    query += ' ORDER BY n.published_at DESC, n.created_at DESC LIMIT ? OFFSET ?';
-    params.push(lim, off);
+    query = query
+      .order('published_at', { ascending: false, nullsFirst: false })
+      .order('created_at', { ascending: false })
+      .range(off, off + lim - 1);
 
-    const [rows] = await pool.execute(query, params);
-    res.json({ success: true, data: rows, count: rows.length });
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    // Mapear imagen principal
+    const mappedData = data.map(item => ({
+      ...item,
+      author_name: item.authors?.name,
+      category_name: item.categories?.name,
+      category_slug: item.categories?.slug,
+      image_url: item.news_images?.[0]?.url
+    }));
+
+    res.json({ success: true, data: mappedData, count: mappedData.length });
   } catch (error) {
     console.error('GET /api/news error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -138,52 +127,55 @@ app.get('/api/news', async (req, res) => {
 app.get('/api/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
-    const [news] = await pool.execute(`
-      SELECT n.*, 
-             a.name as author_name, a.email as author_email,
-             c.name as category_name, c.slug as category_slug
-      FROM news n
-      LEFT JOIN authors a ON n.author_id = a.id
-      LEFT JOIN categories c ON n.main_category_id = c.id
-      WHERE n.id = ?
-    `, [id]);
 
-    if (news.length === 0) {
+    const { data: news, error } = await supabase
+      .from('news')
+      .select(`
+        *,
+        authors(name, email),
+        categories(name, slug)
+      `)
+      .eq('id', id)
+      .single();
+
+    if (error || !news) {
       return res.status(404).json({ success: false, error: 'Noticia no encontrada' });
     }
 
-    const [images] = await pool.execute(
-      'SELECT * FROM news_images WHERE news_id = ? ORDER BY position',
-      [id]
-    );
+    const { data: images } = await supabase
+      .from('news_images')
+      .select('*')
+      .eq('news_id', id)
+      .order('position', { ascending: true });
 
-    const [blocks] = await pool.execute(
-      'SELECT * FROM news_blocks WHERE news_id = ? ORDER BY position',
-      [id]
-    );
+    const { data: blocks } = await supabase
+      .from('news_blocks')
+      .select('*')
+      .eq('news_id', id)
+      .order('position', { ascending: true });
 
-    const [tags] = await pool.execute(`
-      SELECT t.* FROM tags t
-      INNER JOIN news_tags nt ON t.id = nt.tag_id
-      WHERE nt.news_id = ?
-    `, [id]);
+    const { data: tags } = await supabase
+      .from('news_tags')
+      .select('tags(*)')
+      .eq('news_id', id);
 
-    const [related] = await pool.execute(`
-      SELECT n.*, nr.relation_type
-      FROM news n
-      INNER JOIN news_related nr ON n.id = nr.related_news_id
-      WHERE nr.news_id = ?
-    `, [id]);
+    const { data: related } = await supabase
+      .from('news_related')
+      .select('news(*), relation_type')
+      .eq('news_id', id);
 
     res.json({
       success: true,
       data: {
-        ...news[0],
-        images,
-        blocks,
-        tags,
-        related
+        ...news,
+        author_name: news.authors?.name,
+        author_email: news.authors?.email,
+        category_name: news.categories?.name,
+        category_slug: news.categories?.slug,
+        images: images || [],
+        blocks: blocks || [],
+        tags: tags?.map(t => t.tags) || [],
+        related: related || []
       }
     });
   } catch (error) {
@@ -194,10 +186,7 @@ app.get('/api/news/:id', async (req, res) => {
 
 // POST /api/news - Crear nueva noticia
 app.post('/api/news', async (req, res) => {
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-
     const {
       title,
       subtitle,
@@ -212,53 +201,62 @@ app.post('/api/news', async (req, res) => {
       blocks = []
     } = req.body;
 
-    const [result] = await connection.execute(`
-      INSERT INTO news (title, subtitle, summary, author_id, main_category_id, 
-                        status, published_at, is_featured, canonical_slug)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [title, subtitle, summary, author_id, main_category_id, 
-        status, published_at, is_featured, canonical_slug]);
+    const { data: newsData, error: newsError } = await supabase
+      .from('news')
+      .insert([{
+        title,
+        subtitle,
+        summary,
+        author_id,
+        main_category_id,
+        status,
+        published_at,
+        is_featured,
+        canonical_slug
+      }])
+      .select()
+      .single();
 
-    const newsId = result.insertId;
+    if (newsError) throw newsError;
+
+    const newsId = newsData.id;
 
     if (tags.length > 0) {
-      const tagValues = tags.map(tagId => [newsId, tagId]);
-      await connection.query(
-        'INSERT INTO news_tags (news_id, tag_id) VALUES ?',
-        [tagValues]
-      );
+      const tagValues = tags.map(tagId => ({ news_id: newsId, tag_id: tagId }));
+      const { error: tagsError } = await supabase
+        .from('news_tags')
+        .insert(tagValues);
+      if (tagsError) throw tagsError;
     }
 
     if (blocks.length > 0) {
-      for (let i = 0; i < blocks.length; i++) {
-        const block = blocks[i];
-        await connection.execute(`
-          INSERT INTO news_blocks (news_id, type, content, media_url, alt_text, position)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `, [newsId, block.type, block.content, block.media_url, block.alt_text, i]);
-      }
+      const blockValues = blocks.map((block, i) => ({
+        news_id: newsId,
+        type: block.type,
+        content: block.content,
+        media_url: block.media_url,
+        alt_text: block.alt_text,
+        position: i
+      }));
+      const { error: blocksError } = await supabase
+        .from('news_blocks')
+        .insert(blockValues);
+      if (blocksError) throw blocksError;
     }
 
-    await connection.commit();
-    res.status(201).json({ 
-      success: true, 
+    res.status(201).json({
+      success: true,
       data: { id: newsId, message: 'Noticia creada exitosamente' }
     });
   } catch (error) {
-    await connection.rollback();
     console.error('POST /api/news error:', error);
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    connection.release();
   }
 });
 
 // PUT /api/news/:id - Actualizar noticia existente
 app.put('/api/news/:id', async (req, res) => {
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-
     const { id } = req.params;
     const {
       title,
@@ -274,47 +272,65 @@ app.put('/api/news/:id', async (req, res) => {
       blocks
     } = req.body;
 
-    await connection.execute(`
-      UPDATE news 
-      SET title = ?, subtitle = ?, summary = ?, author_id = ?, 
-          main_category_id = ?, status = ?, published_at = ?, 
-          is_featured = ?, canonical_slug = ?
-      WHERE id = ?
-    `, [title, subtitle, summary, author_id, main_category_id, 
-        status, published_at, is_featured, canonical_slug, id]);
+    const updateData = {};
+    if (title !== undefined) updateData.title = title;
+    if (subtitle !== undefined) updateData.subtitle = subtitle;
+    if (summary !== undefined) updateData.summary = summary;
+    if (author_id !== undefined) updateData.author_id = author_id;
+    if (main_category_id !== undefined) updateData.main_category_id = main_category_id;
+    if (status !== undefined) updateData.status = status;
+    if (published_at !== undefined) updateData.published_at = published_at;
+    if (is_featured !== undefined) updateData.is_featured = is_featured;
+    if (canonical_slug !== undefined) updateData.canonical_slug = canonical_slug;
+
+    const { error: updateError } = await supabase
+      .from('news')
+      .update(updateData)
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     if (tags !== undefined) {
-      await connection.execute('DELETE FROM news_tags WHERE news_id = ?', [id]);
+      await supabase
+        .from('news_tags')
+        .delete()
+        .eq('news_id', id);
+
       if (tags.length > 0) {
-        const tagValues = tags.map(tagId => [id, tagId]);
-        await connection.query(
-          'INSERT INTO news_tags (news_id, tag_id) VALUES ?',
-          [tagValues]
-        );
+        const tagValues = tags.map(tagId => ({ news_id: id, tag_id: tagId }));
+        const { error: tagsError } = await supabase
+          .from('news_tags')
+          .insert(tagValues);
+        if (tagsError) throw tagsError;
       }
     }
 
     if (blocks !== undefined) {
-      await connection.execute('DELETE FROM news_blocks WHERE news_id = ?', [id]);
+      await supabase
+        .from('news_blocks')
+        .delete()
+        .eq('news_id', id);
+
       if (blocks.length > 0) {
-        for (let i = 0; i < blocks.length; i++) {
-          const block = blocks[i];
-          await connection.execute(`
-            INSERT INTO news_blocks (news_id, type, content, media_url, alt_text, position)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `, [id, block.type, block.content, block.media_url, block.alt_text, i]);
-        }
+        const blockValues = blocks.map((block, i) => ({
+          news_id: id,
+          type: block.type,
+          content: block.content,
+          media_url: block.media_url,
+          alt_text: block.alt_text,
+          position: i
+        }));
+        const { error: blocksError } = await supabase
+          .from('news_blocks')
+          .insert(blockValues);
+        if (blocksError) throw blocksError;
       }
     }
 
-    await connection.commit();
     res.json({ success: true, message: 'Noticia actualizada exitosamente' });
   } catch (error) {
-    await connection.rollback();
     console.error('PUT /api/news/:id error:', error);
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    connection.release();
   }
 });
 
@@ -322,11 +338,12 @@ app.put('/api/news/:id', async (req, res) => {
 app.delete('/api/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const [result] = await pool.execute('DELETE FROM news WHERE id = ?', [id]);
-    
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ success: false, error: 'Noticia no encontrada' });
-    }
+    const { error } = await supabase
+      .from('news')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
 
     res.json({ success: true, message: 'Noticia eliminada exitosamente' });
   } catch (error) {
@@ -337,24 +354,19 @@ app.delete('/api/news/:id', async (req, res) => {
 
 // ==================== IMÁGENES DE NOTICIAS ====================
 
-// Helper: extraer public_id de Cloudinary desde la URL
 function getPublicIdFromCloudinaryUrl(url) {
   try {
-    // ej: https://res.cloudinary.com/<cloud>/image/upload/v123/news/news-12345.jpg
     const parts = url.split('/');
     const uploadIndex = parts.findIndex(p => p === 'upload');
     if (uploadIndex === -1) return null;
 
-    let publicParts = parts.slice(uploadIndex + 1); // puede empezar con v123
-    // remover versión si existe (v123)
+    let publicParts = parts.slice(uploadIndex + 1);
     if (publicParts[0] && /^v\d+$/.test(publicParts[0])) publicParts.shift();
 
-    // remove file extension from last part
     const last = publicParts.pop();
     const lastNoExt = last.replace(/\.[^/.]+$/, '');
     publicParts.push(lastNoExt);
 
-    // join with '/'
     return publicParts.join('/');
   } catch (err) {
     return null;
@@ -366,25 +378,33 @@ app.post('/api/news/:id/images', upload.single('image'), async (req, res) => {
   try {
     const { id } = req.params;
     const { caption, alt_text, position = 0 } = req.body;
-    
+
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No se proporcionó imagen' });
     }
 
-    // req.file.path contiene la URL pública de Cloudinary cuando se usa multer-storage-cloudinary
     const imageUrl = req.file.path;
 
-    const [result] = await pool.execute(`
-      INSERT INTO news_images (news_id, url, caption, alt_text, position)
-      VALUES (?, ?, ?, ?, ?)
-    `, [id, imageUrl, caption, alt_text, position]);
-
-    res.status(201).json({ 
-      success: true, 
-      data: { 
-        id: result.insertId, 
+    const { data: imageData, error } = await supabase
+      .from('news_images')
+      .insert([{
+        news_id: parseInt(id, 10),
         url: imageUrl,
-        message: 'Imagen subida exitosamente' 
+        caption,
+        alt_text,
+        position: parseInt(position, 10)
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json({
+      success: true,
+      data: {
+        id: imageData.id,
+        url: imageUrl,
+        message: 'Imagen subida exitosamente'
       }
     });
   } catch (error) {
@@ -397,86 +417,90 @@ app.post('/api/news/:id/images', upload.single('image'), async (req, res) => {
 app.get('/api/news/:id/images', async (req, res) => {
   try {
     const { id } = req.params;
-    const [images] = await pool.execute(
-      'SELECT * FROM news_images WHERE news_id = ? ORDER BY position',
-      [id]
-    );
-    res.json({ success: true, data: images });
+    const { data: images, error } = await supabase
+      .from('news_images')
+      .select('*')
+      .eq('news_id', id)
+      .order('position', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ success: true, data: images || [] });
   } catch (error) {
     console.error('GET /api/news/:id/images error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// DELETE /api/news/:newsId/images/:imageId - Eliminar imagen específica (DB + Cloudinary)
+// DELETE /api/news/:newsId/images/:imageId - Eliminar imagen específica
 app.delete('/api/news/:newsId/images/:imageId', async (req, res) => {
-  const connection = await pool.getConnection();
   try {
     const { newsId, imageId } = req.params;
 
-    // Primero obtener la URL para borrar en Cloudinary
-    const [rows] = await connection.execute(
-      'SELECT * FROM news_images WHERE id = ? AND news_id = ?',
-      [imageId, newsId]
-    );
-    if (rows.length === 0) {
+    const { data: imageData, error: selectError } = await supabase
+      .from('news_images')
+      .select('*')
+      .eq('id', imageId)
+      .eq('news_id', newsId)
+      .single();
+
+    if (selectError || !imageData) {
       return res.status(404).json({ success: false, error: 'Imagen no encontrada' });
     }
-    const image = rows[0];
-    const imageUrl = image.url;
 
-    // Intentar eliminar en Cloudinary (si se puede obtener public_id)
-    const publicId = getPublicIdFromCloudinaryUrl(imageUrl);
+    const publicId = getPublicIdFromCloudinaryUrl(imageData.url);
     if (publicId) {
       try {
         await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
       } catch (err) {
-        // Si falla, seguimos para no bloquear la eliminación en BD
         console.error('Error al eliminar imagen en Cloudinary:', err);
       }
     }
 
-    // Eliminar en BD
-    const [result] = await connection.execute(
-      'DELETE FROM news_images WHERE id = ?',
-      [imageId]
-    );
+    const { error: deleteError } = await supabase
+      .from('news_images')
+      .delete()
+      .eq('id', imageId);
 
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ success: false, error: 'Imagen no encontrada al eliminar' });
-    }
+    if (deleteError) throw deleteError;
 
     res.json({ success: true, message: 'Imagen eliminada exitosamente' });
   } catch (error) {
     console.error('DELETE /api/news/:newsId/images/:imageId error:', error);
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    connection.release();
   }
 });
 
 // ==================== CATEGORÍAS ====================
 
-// GET /api/categories - Obtener todas las categorías (ya existente)
+// GET /api/categories
 app.get('/api/categories', async (req, res) => {
   try {
-    const [categories] = await pool.execute(`
-      SELECT c.*, 
-             p.name as parent_name 
-      FROM categories c
-      LEFT JOIN categories p ON c.parent_id = p.id
-      ORDER BY c.position, c.name
-    `);
-    res.json({ success: true, data: categories });
+    const { data: categories, error } = await supabase
+      .from('categories')
+      .select(`
+        *,
+        parent:parent_id(name)
+      `)
+      .order('position', { ascending: true })
+      .order('name', { ascending: true });
+
+    if (error) throw error;
+
+    const mappedData = categories.map(cat => ({
+      ...cat,
+      parent_name: cat.parent?.name
+    }));
+
+    res.json({ success: true, data: mappedData });
   } catch (error) {
     console.error('GET /api/categories error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// POST /api/categories - Crear categoría o subcategoría
+// POST /api/categories
 app.post('/api/categories', async (req, res) => {
-  const connection = await pool.getConnection();
   try {
     const { name, slug, parent_id = null, position = 0, description = null } = req.body;
 
@@ -484,127 +508,144 @@ app.post('/api/categories', async (req, res) => {
       return res.status(400).json({ success: false, error: 'name y slug son obligatorios' });
     }
 
-    // si parent_id se proporcionó, verificar que exista
     if (parent_id !== null && parent_id !== '' && parent_id !== undefined) {
-      const [parentRows] = await connection.execute('SELECT id FROM categories WHERE id = ?', [parent_id]);
-      if (parentRows.length === 0) {
+      const { data: parentData } = await supabase
+        .from('categories')
+        .select('id')
+        .eq('id', parent_id)
+        .single();
+
+      if (!parentData) {
         return res.status(400).json({ success: false, error: 'parent_id no existe' });
       }
     }
 
-    const [result] = await connection.execute(`
-      INSERT INTO categories (name, slug, parent_id, position, description)
-      VALUES (?, ?, ?, ?, ?)
-    `, [name, slug, parent_id || null, position, description]);
+    const { data: categoryData, error } = await supabase
+      .from('categories')
+      .insert([{
+        name,
+        slug,
+        parent_id: parent_id || null,
+        position,
+        description
+      }])
+      .select()
+      .single();
 
-    res.status(201).json({ success: true, data: { id: result.insertId, message: 'Categoría creada exitosamente' } });
+    if (error) throw error;
+
+    res.status(201).json({
+      success: true,
+      data: { id: categoryData.id, message: 'Categoría creada exitosamente' }
+    });
   } catch (error) {
     console.error('POST /api/categories error:', error);
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    connection.release();
   }
 });
 
-// PUT /api/categories/:id - Actualizar categoría
+// PUT /api/categories/:id
 app.put('/api/categories/:id', async (req, res) => {
-  const connection = await pool.getConnection();
   try {
     const { id } = req.params;
-    const { name, slug, parent_id = null, position, description } = req.body;
+    const { name, slug, parent_id, position, description } = req.body;
 
-    // verificar que la categoría exista
-    const [existing] = await connection.execute('SELECT * FROM categories WHERE id = ?', [id]);
-    if (existing.length === 0) {
+    const { data: existing } = await supabase
+      .from('categories')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!existing) {
       return res.status(404).json({ success: false, error: 'Categoría no encontrada' });
     }
 
-    // prevenir que la categoría se ponga como su propio padre
     if (parent_id && parseInt(parent_id, 10) === parseInt(id, 10)) {
       return res.status(400).json({ success: false, error: 'parent_id no puede ser igual al id de la categoría' });
     }
 
-    // si parent_id se proporcionó, verificar que exista
     if (parent_id !== null && parent_id !== '' && parent_id !== undefined) {
-      const [parentRows] = await connection.execute('SELECT id FROM categories WHERE id = ?', [parent_id]);
-      if (parentRows.length === 0) {
+      const { data: parentData } = await supabase
+        .from('categories')
+        .select('id')
+        .eq('id', parent_id)
+        .single();
+
+      if (!parentData) {
         return res.status(400).json({ success: false, error: 'parent_id no existe' });
       }
     }
 
-    // actualizar (solo campos pasados)
-    const fields = [];
-    const params = [];
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (slug !== undefined) updateData.slug = slug;
+    if (parent_id !== undefined) updateData.parent_id = parent_id || null;
+    if (position !== undefined) updateData.position = position;
+    if (description !== undefined) updateData.description = description;
 
-    if (name !== undefined) {
-      fields.push('name = ?'); params.push(name);
-    }
-    if (slug !== undefined) {
-      fields.push('slug = ?'); params.push(slug);
-    }
-    if (parent_id !== undefined) {
-      fields.push('parent_id = ?'); params.push(parent_id || null);
-    }
-    if (position !== undefined) {
-      fields.push('position = ?'); params.push(position);
-    }
-    if (description !== undefined) {
-      fields.push('description = ?'); params.push(description);
-    }
-
-    if (fields.length === 0) {
+    if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ success: false, error: 'No hay campos para actualizar' });
     }
 
-    params.push(id);
-    const sql = `UPDATE categories SET ${fields.join(', ')} WHERE id = ?`;
-    await connection.execute(sql, params);
+    const { error } = await supabase
+      .from('categories')
+      .update(updateData)
+      .eq('id', id);
+
+    if (error) throw error;
 
     res.json({ success: true, message: 'Categoría actualizada exitosamente' });
   } catch (error) {
     console.error('PUT /api/categories/:id error:', error);
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    connection.release();
   }
 });
 
-// DELETE /api/categories/:id - Eliminar categoría (solo si no tiene hijos ni noticias)
+// DELETE /api/categories/:id
 app.delete('/api/categories/:id', async (req, res) => {
-  const connection = await pool.getConnection();
   try {
     const { id } = req.params;
 
-    // verificar existencia
-    const [existing] = await connection.execute('SELECT id FROM categories WHERE id = ?', [id]);
-    if (existing.length === 0) {
+    const { data: existing } = await supabase
+      .from('categories')
+      .select('id')
+      .eq('id', id)
+      .single();
+
+    if (!existing) {
       return res.status(404).json({ success: false, error: 'Categoría no encontrada' });
     }
 
-    // verificar si tiene subcategorías
-    const [children] = await connection.execute('SELECT id FROM categories WHERE parent_id = ?', [id]);
-    if (children.length > 0) {
+    const { data: children } = await supabase
+      .from('categories')
+      .select('id')
+      .eq('parent_id', id);
+
+    if (children && children.length > 0) {
       return res.status(400).json({ success: false, error: 'No se puede eliminar: la categoría tiene subcategorías' });
     }
 
-    // verificar si tiene noticias asociadas (main_category_id)
-    const [newsRows] = await connection.execute('SELECT id FROM news WHERE main_category_id = ? LIMIT 1', [id]);
-    if (newsRows.length > 0) {
+    const { data: newsRows } = await supabase
+      .from('news')
+      .select('id')
+      .eq('main_category_id', id)
+      .limit(1);
+
+    if (newsRows && newsRows.length > 0) {
       return res.status(400).json({ success: false, error: 'No se puede eliminar: la categoría está asociada a noticias' });
     }
 
-    // eliminar
-    const [result] = await connection.execute('DELETE FROM categories WHERE id = ?', [id]);
-    if (result.affectedRows === 0) {
-      return res.status(500).json({ success: false, error: 'No se pudo eliminar la categoría' });
-    }
+    const { error } = await supabase
+      .from('categories')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
 
     res.json({ success: true, message: 'Categoría eliminada exitosamente' });
   } catch (error) {
     console.error('DELETE /api/categories/:id error:', error);
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    connection.release();
   }
 });
 
@@ -612,8 +653,14 @@ app.delete('/api/categories/:id', async (req, res) => {
 
 app.get('/api/authors', async (req, res) => {
   try {
-    const [authors] = await pool.execute('SELECT * FROM authors ORDER BY name');
-    res.json({ success: true, data: authors });
+    const { data: authors, error } = await supabase
+      .from('authors')
+      .select('*')
+      .order('name', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ success: true, data: authors || [] });
   } catch (error) {
     console.error('GET /api/authors error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -624,8 +671,14 @@ app.get('/api/authors', async (req, res) => {
 
 app.get('/api/tags', async (req, res) => {
   try {
-    const [tags] = await pool.execute('SELECT * FROM tags ORDER BY name');
-    res.json({ success: true, data: tags });
+    const { data: tags, error } = await supabase
+      .from('tags')
+      .select('*')
+      .order('name', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ success: true, data: tags || [] });
   } catch (error) {
     console.error('GET /api/tags error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -635,13 +688,18 @@ app.get('/api/tags', async (req, res) => {
 app.post('/api/tags', async (req, res) => {
   try {
     const { name, slug } = req.body;
-    const [result] = await pool.execute(
-      'INSERT INTO tags (name, slug) VALUES (?, ?)',
-      [name, slug]
-    );
-    res.status(201).json({ 
-      success: true, 
-      data: { id: result.insertId, message: 'Tag creado exitosamente' }
+
+    const { data: tagData, error } = await supabase
+      .from('tags')
+      .insert([{ name, slug }])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json({
+      success: true,
+      data: { id: tagData.id, message: 'Tag creado exitosamente' }
     });
   } catch (error) {
     console.error('POST /api/tags error:', error);
@@ -658,14 +716,12 @@ app.listen(PORT, () => {
   console.log(`📡 API disponible en http://localhost:${PORT}/api`);
 });
 
-// Manejo de errores no capturados
 process.on('unhandledRejection', (err) => {
   console.error('Error no manejado:', err);
 });
+
 process.on('uncaughtException', (err) => {
   console.error('Exception no capturada:', err);
-  // opcional: process.exit(1);
 });
 
 module.exports = app;
-
