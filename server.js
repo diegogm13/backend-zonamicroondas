@@ -66,6 +66,19 @@ const upload = multer({
   fileFilter
 });
 
+// Helper function to generate slug
+function generateSlug(text) {
+  return text
+    .toString()
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^\w\-]+/g, '')
+    .replace(/\-\-+/g, '-')
+    .replace(/^-+/, '')
+    .replace(/-+$/, '');
+}
+
 // ==================== NOTICIAS ====================
 
 // GET /api/news - Obtener todas las noticias (con filtros opcionales)
@@ -107,7 +120,6 @@ app.get('/api/news', async (req, res) => {
 
     if (error) throw error;
 
-    // Mapear imagen principal
     const mappedData = data.map(item => ({
       ...item,
       author_name: item.authors?.name,
@@ -651,6 +663,7 @@ app.delete('/api/categories/:id', async (req, res) => {
 
 // ==================== AUTORES ====================
 
+// GET /api/authors - Obtener todos los autores
 app.get('/api/authors', async (req, res) => {
   try {
     const { data: authors, error } = await supabase
@@ -663,6 +676,200 @@ app.get('/api/authors', async (req, res) => {
     res.json({ success: true, data: authors || [] });
   } catch (error) {
     console.error('GET /api/authors error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/authors/:id - Obtener un autor específico
+app.get('/api/authors/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: author, error } = await supabase
+      .from('authors')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error || !author) {
+      return res.status(404).json({ success: false, error: 'Autor no encontrado' });
+    }
+
+    res.json({ success: true, data: author });
+  } catch (error) {
+    console.error('GET /api/authors/:id error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/authors - Crear nuevo autor
+app.post('/api/authors', async (req, res) => {
+  try {
+    const { name, email = null, bio = null } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ success: false, error: 'name es obligatorio' });
+    }
+
+    const slug = generateSlug(name);
+
+    const { data: existingSlug } = await supabase
+      .from('authors')
+      .select('id')
+      .eq('slug', slug)
+      .single();
+
+    let finalSlug = slug;
+    if (existingSlug) {
+      finalSlug = `${slug}-${Date.now()}`;
+    }
+
+    if (email) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email)) {
+        return res.status(400).json({ success: false, error: 'El email no tiene un formato válido' });
+      }
+
+      const { data: existingEmail } = await supabase
+        .from('authors')
+        .select('id')
+        .eq('email', email)
+        .single();
+
+      if (existingEmail) {
+        return res.status(400).json({ success: false, error: 'Ya existe un autor con ese email' });
+      }
+    }
+
+    const { data: authorData, error } = await supabase
+      .from('authors')
+      .insert([{
+        name,
+        slug: finalSlug,
+        email,
+        bio
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json({
+      success: true,
+      data: { id: authorData.id, slug: finalSlug, message: 'Autor creado exitosamente' }
+    });
+  } catch (error) {
+    console.error('POST /api/authors error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT /api/authors/:id - Actualizar autor existente
+app.put('/api/authors/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, slug, email, bio } = req.body;
+
+    const { data: existing } = await supabase
+      .from('authors')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!existing) {
+      return res.status(404).json({ success: false, error: 'Autor no encontrado' });
+    }
+
+    if (slug !== undefined && slug !== existing.slug) {
+      const { data: slugExists } = await supabase
+        .from('authors')
+        .select('id')
+        .eq('slug', slug)
+        .neq('id', id)
+        .single();
+
+      if (slugExists) {
+        return res.status(400).json({ success: false, error: 'Ya existe otro autor con ese slug' });
+      }
+    }
+
+    if (email !== undefined && email !== null && email !== '') {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email)) {
+        return res.status(400).json({ success: false, error: 'El email no tiene un formato válido' });
+      }
+
+      const { data: emailExists } = await supabase
+        .from('authors')
+        .select('id')
+        .eq('email', email)
+        .neq('id', id)
+        .single();
+
+      if (emailExists) {
+        return res.status(400).json({ success: false, error: 'Ya existe otro autor con ese email' });
+      }
+    }
+
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (slug !== undefined) updateData.slug = slug;
+    if (email !== undefined) updateData.email = email || null;
+    if (bio !== undefined) updateData.bio = bio;
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ success: false, error: 'No hay campos para actualizar' });
+    }
+
+    const { error } = await supabase
+      .from('authors')
+      .update(updateData)
+      .eq('id', id);
+
+    if (error) throw error;
+
+    res.json({ success: true, message: 'Autor actualizado exitosamente' });
+  } catch (error) {
+    console.error('PUT /api/authors/:id error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/authors/:id - Eliminar autor
+app.delete('/api/authors/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: existing } = await supabase
+      .from('authors')
+      .select('id')
+      .eq('id', id)
+      .single();
+
+    if (!existing) {
+      return res.status(404).json({ success: false, error: 'Autor no encontrado' });
+    }
+
+    const { data: newsRows } = await supabase
+      .from('news')
+      .select('id')
+      .eq('author_id', id)
+      .limit(1);
+
+    if (newsRows && newsRows.length > 0) {
+      return res.status(400).json({ success: false, error: 'No se puede eliminar: el autor tiene noticias asociadas' });
+    }
+
+    const { error } = await supabase
+      .from('authors')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+
+    res.json({ success: true, message: 'Autor eliminado exitosamente' });
+  } catch (error) {
+    console.error('DELETE /api/authors/:id error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
