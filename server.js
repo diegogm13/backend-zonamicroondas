@@ -914,6 +914,164 @@ app.post('/api/tags', async (req, res) => {
   }
 });
 
+// ==================== Login ====================
+// ==================== AUTENTICACIÓN ====================
+
+// POST /api/auth/login - Iniciar sesión
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Email y contraseña son obligatorios' 
+      });
+    }
+
+    // Buscar usuario por email
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (error || !user) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Credenciales inválidas' 
+      });
+    }
+
+    // Verificar contraseña (en texto plano - SOLO PARA DESARROLLO)
+    // IMPORTANTE: En producción debes usar bcrypt para hashear contraseñas
+    if (user.password !== password) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Credenciales inválidas' 
+      });
+    }
+
+    // Login exitoso - NO devolver la contraseña
+    const { password: _, ...userWithoutPassword } = user;
+
+    res.json({ 
+      success: true, 
+      data: {
+        user: userWithoutPassword,
+        message: 'Login exitoso'
+      }
+    });
+
+  } catch (error) {
+    console.error('POST /api/auth/login error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/auth/register - Registrar nuevo usuario (opcional)
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Email y contraseña son obligatorios' 
+      });
+    }
+
+    // Validar formato de email
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Email inválido' 
+      });
+    }
+
+    // Verificar si el email ya existe
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email)
+      .single();
+
+    if (existingUser) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'El email ya está registrado' 
+      });
+    }
+
+    // Crear nuevo usuario
+    // IMPORTANTE: En producción, hashea la contraseña con bcrypt
+    const { data: newUser, error } = await supabase
+      .from('users')
+      .insert([{
+        email,
+        password, // INSEGURO: hashear en producción
+        name: name || email.split('@')[0],
+        role: 'admin'
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    const { password: _, ...userWithoutPassword } = newUser;
+
+    res.status(201).json({ 
+      success: true, 
+      data: {
+        user: userWithoutPassword,
+        message: 'Usuario registrado exitosamente'
+      }
+    });
+
+  } catch (error) {
+    console.error('POST /api/auth/register error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/auth/verify - Verificar sesión (opcional)
+app.get('/api/auth/verify', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+
+    if (!user_id) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'No autenticado' 
+      });
+    }
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id, email, name, role, created_at')
+      .eq('id', user_id)
+      .single();
+
+    if (error || !user) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Usuario no encontrado' 
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      data: { user }
+    });
+
+  } catch (error) {
+    console.error('GET /api/auth/verify error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
 // ==================== SERVIDOR ====================
 
 const PORT = process.env.PORT || 3001;
