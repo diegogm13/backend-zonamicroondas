@@ -1,4 +1,4 @@
-// server.js (Migrado a Supabase)
+// server.js (Migrado a Supabase) - con slugs automáticos al pedir por id
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
@@ -66,10 +66,12 @@ const upload = multer({
   fileFilter
 });
 
-// Helper function to generate slug
+// Helper: generar slug "limpio"
 function generateSlug(text) {
   return text
     .toString()
+    .normalize('NFD')               // Normalizar acentos
+    .replace(/[\u0300-\u036f]/g, '')// Eliminar diacríticos
     .toLowerCase()
     .trim()
     .replace(/\s+/g, '-')
@@ -77,6 +79,38 @@ function generateSlug(text) {
     .replace(/\-\-+/g, '-')
     .replace(/^-+/, '')
     .replace(/-+$/, '');
+}
+
+// Helper: asegurar slug único, opcionalmente excluyendo un id (para updates)
+async function ensureUniqueSlug(baseSlug, excludeId = null) {
+  let slug = baseSlug;
+  let counter = 0;
+
+  while (true) {
+    let query = supabase
+      .from('news')
+      .select('id');
+
+    query = query.eq('canonical_slug', slug);
+
+    if (excludeId) {
+      query = query.neq('id', excludeId);
+    }
+
+    // Ejecutar la consulta
+    const { data: rows, error } = await query.limit(1);
+
+    if (error) {
+      throw error;
+    }
+
+    if (!rows || rows.length === 0) {
+      return slug;
+    }
+
+    counter += 1;
+    slug = `${baseSlug}-${counter}`;
+  }
 }
 
 // ==================== NOTICIAS ====================
@@ -125,7 +159,8 @@ app.get('/api/news', async (req, res) => {
       author_name: item.authors?.name,
       category_name: item.categories?.name,
       category_slug: item.categories?.slug,
-      image_url: item.news_images?.[0]?.url
+      image_url: item.news_images?.[0]?.url,
+      canonical_slug: item.canonical_slug // aseguramos enviarlo al frontend
     }));
 
     res.json({ success: true, data: mappedData, count: mappedData.length });
@@ -135,7 +170,8 @@ app.get('/api/news', async (req, res) => {
   }
 });
 
-// GET /api/news/:id - Obtener una noticia específica con todas sus relaciones
+// GET /api/news/:id - Obtener una noticia específica con todas sus relaciones (por id)
+// Si la noticia no tiene canonical_slug, lo generamos, lo guardamos y lo devolvemos.
 app.get('/api/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -143,7 +179,7 @@ app.get('/api/news/:id', async (req, res) => {
     const { data: news, error } = await supabase
       .from('news')
       .select(`
-        *,
+        * ,
         authors(name, email),
         categories(name, slug)
       `)
@@ -152,6 +188,27 @@ app.get('/api/news/:id', async (req, res) => {
 
     if (error || !news) {
       return res.status(404).json({ success: false, error: 'Noticia no encontrada' });
+    }
+
+    // Si no tiene canonical_slug, generarlo y actualizar la fila
+    if (!news.canonical_slug) {
+      try {
+        const base = generateSlug(news.title || `news-${news.id}`);
+        const final = await ensureUniqueSlug(base, parseInt(id, 10));
+        const { error: upErr } = await supabase
+          .from('news')
+          .update({ canonical_slug: final })
+          .eq('id', id);
+
+        if (!upErr) {
+          news.canonical_slug = final;
+        } else {
+          console.error('Error al actualizar canonical_slug para id', id, upErr);
+        }
+      } catch (slugErr) {
+        console.error('Error generando slug para noticia id', id, slugErr);
+        // No abortamos: seguimos devolviendo la noticia aunque no se haya guardado el slug
+      }
     }
 
     const { data: images } = await supabase
@@ -196,7 +253,67 @@ app.get('/api/news/:id', async (req, res) => {
   }
 });
 
-// POST /api/news - Crear nueva noticia
+// GET /api/news/slug/:slug - Obtener noticia por slug
+app.get('/api/news/slug/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { data: news, error } = await supabase
+      .from('news')
+      .select(`
+        *,
+        authors(name, email),
+        categories(name, slug)
+      `)
+      .eq('canonical_slug', slug)
+      .single();
+
+    if (error || !news) {
+      return res.status(404).json({ success: false, error: 'Noticia no encontrada' });
+    }
+
+    const { data: images } = await supabase
+      .from('news_images')
+      .select('*')
+      .eq('news_id', news.id)
+      .order('position', { ascending: true });
+
+    const { data: blocks } = await supabase
+      .from('news_blocks')
+      .select('*')
+      .eq('news_id', news.id)
+      .order('position', { ascending: true });
+
+    const { data: tags } = await supabase
+      .from('news_tags')
+      .select('tags(*)')
+      .eq('news_id', news.id);
+
+    const { data: related } = await supabase
+      .from('news_related')
+      .select('news(*), relation_type')
+      .eq('news_id', news.id);
+
+    res.json({
+      success: true,
+      data: {
+        ...news,
+        author_name: news.authors?.name,
+        author_email: news.authors?.email,
+        category_name: news.categories?.name,
+        category_slug: news.categories?.slug,
+        images: images || [],
+        blocks: blocks || [],
+        tags: tags?.map(t => t.tags) || [],
+        related: related || []
+      }
+    });
+  } catch (error) {
+    console.error('GET /api/news/slug/:slug error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/news - Crear nueva noticia (genera canonical_slug si no llega)
 app.post('/api/news', async (req, res) => {
   try {
     const {
@@ -213,6 +330,16 @@ app.post('/api/news', async (req, res) => {
       blocks = []
     } = req.body;
 
+    // Determinar slug final
+    let finalSlug = canonical_slug;
+    if (finalSlug) {
+      finalSlug = generateSlug(finalSlug);
+      finalSlug = await ensureUniqueSlug(finalSlug);
+    } else if (title) {
+      const base = generateSlug(title);
+      finalSlug = await ensureUniqueSlug(base);
+    }
+
     const { data: newsData, error: newsError } = await supabase
       .from('news')
       .insert([{
@@ -224,7 +351,7 @@ app.post('/api/news', async (req, res) => {
         status,
         published_at,
         is_featured,
-        canonical_slug
+        canonical_slug: finalSlug
       }])
       .select()
       .single();
@@ -258,7 +385,7 @@ app.post('/api/news', async (req, res) => {
 
     res.status(201).json({
       success: true,
-      data: { id: newsId, message: 'Noticia creada exitosamente' }
+      data: { id: newsId, canonical_slug: finalSlug, message: 'Noticia creada exitosamente' }
     });
   } catch (error) {
     console.error('POST /api/news error:', error);
@@ -266,7 +393,7 @@ app.post('/api/news', async (req, res) => {
   }
 });
 
-// PUT /api/news/:id - Actualizar noticia existente
+// PUT /api/news/:id - Actualizar noticia existente (maneja canonical_slug único)
 app.put('/api/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -293,14 +420,24 @@ app.put('/api/news/:id', async (req, res) => {
     if (status !== undefined) updateData.status = status;
     if (published_at !== undefined) updateData.published_at = published_at;
     if (is_featured !== undefined) updateData.is_featured = is_featured;
-    if (canonical_slug !== undefined) updateData.canonical_slug = canonical_slug;
 
-    const { error: updateError } = await supabase
-      .from('news')
-      .update(updateData)
-      .eq('id', id);
+    // Si se envía canonical_slug, procesarlo (slugify + asegurar unicidad, excluyendo este id)
+    if (canonical_slug !== undefined) {
+      let finalSlug = canonical_slug ? generateSlug(canonical_slug) : null;
+      if (finalSlug) {
+        finalSlug = await ensureUniqueSlug(finalSlug, parseInt(id, 10));
+      }
+      updateData.canonical_slug = finalSlug;
+    }
 
-    if (updateError) throw updateError;
+    if (Object.keys(updateData).length > 0) {
+      const { error: updateError } = await supabase
+        .from('news')
+        .update(updateData)
+        .eq('id', id);
+
+      if (updateError) throw updateError;
+    }
 
     if (tags !== undefined) {
       await supabase
@@ -717,10 +854,10 @@ app.post('/api/authors', async (req, res) => {
       .from('authors')
       .select('id')
       .eq('slug', slug)
-      .single();
+      .limit(1);
 
     let finalSlug = slug;
-    if (existingSlug) {
+    if (existingSlug && existingSlug.length > 0) {
       finalSlug = `${slug}-${Date.now()}`;
     }
 
@@ -734,9 +871,9 @@ app.post('/api/authors', async (req, res) => {
         .from('authors')
         .select('id')
         .eq('email', email)
-        .single();
+        .limit(1);
 
-      if (existingEmail) {
+      if (existingEmail && existingEmail.length > 0) {
         return res.status(400).json({ success: false, error: 'Ya existe un autor con ese email' });
       }
     }
@@ -786,9 +923,9 @@ app.put('/api/authors/:id', async (req, res) => {
         .select('id')
         .eq('slug', slug)
         .neq('id', id)
-        .single();
+        .limit(1);
 
-      if (slugExists) {
+      if (slugExists && slugExists.length > 0) {
         return res.status(400).json({ success: false, error: 'Ya existe otro autor con ese slug' });
       }
     }
@@ -804,9 +941,9 @@ app.put('/api/authors/:id', async (req, res) => {
         .select('id')
         .eq('email', email)
         .neq('id', id)
-        .single();
+        .limit(1);
 
-      if (emailExists) {
+      if (emailExists && emailExists.length > 0) {
         return res.status(400).json({ success: false, error: 'Ya existe otro autor con ese email' });
       }
     }
@@ -914,7 +1051,6 @@ app.post('/api/tags', async (req, res) => {
   }
 });
 
-// ==================== Login ====================
 // ==================== AUTENTICACIÓN ====================
 
 // POST /api/auth/login - Iniciar sesión
@@ -1071,6 +1207,71 @@ app.get('/api/auth/verify', async (req, res) => {
   }
 });
 
+// ==================== RUTA DE REDIRECCIÓN (opcional) ====================
+// Redirige de /news/by-id/:id a /:categorySlug/articulos/:slug o /news/:slug, 
+// generando slug si hace falta (y actualizando la fila)
+app.get('/news/by-id/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // obtener noticia (sin relaciones pesadas)
+    const { data: newsRow, error: fetchErr } = await supabase
+      .from('news')
+      .select('id, title, canonical_slug, main_category_id')
+      .eq('id', parseInt(id, 10))
+      .single();
+
+    if (fetchErr || !newsRow) {
+      return res.status(404).send('Noticia no encontrada');
+    }
+
+    let slug = newsRow.canonical_slug;
+
+    // si no tiene slug, generarlo y actualizar
+    if (!slug) {
+      try {
+        const base = generateSlug(newsRow.title || `news-${newsRow.id}`);
+        const final = await ensureUniqueSlug(base, parseInt(id, 10));
+        const { error: upErr } = await supabase
+          .from('news')
+          .update({ canonical_slug: final })
+          .eq('id', id);
+
+        if (!upErr) {
+          slug = final;
+        } else {
+          console.error('Error actualizando canonical_slug (by-id):', upErr);
+        }
+      } catch (err) {
+        console.error('Error generando slug (by-id):', err);
+      }
+    }
+
+    // intentar obtener slug de categoría para construir ruta bonita
+    let categorySlug = null;
+    if (newsRow.main_category_id) {
+      const { data: cat, error: catErr } = await supabase
+        .from('categories')
+        .select('slug')
+        .eq('id', newsRow.main_category_id)
+        .single();
+
+      if (!catErr && cat) categorySlug = cat.slug;
+    }
+
+    if (!slug) {
+      return res.status(404).send('Noticia no encontrada');
+    }
+
+    if (categorySlug) {
+      return res.redirect(301, `/${encodeURIComponent(categorySlug)}/articulos/${encodeURIComponent(slug)}`);
+    } else {
+      return res.redirect(301, `/news/${encodeURIComponent(slug)}`);
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error interno');
+  }
+});
 
 // ==================== SERVIDOR ====================
 
