@@ -1,4 +1,4 @@
-// server.js (Express + Supabase + Cloudinary + OG endpoint y /news/:id que detecta bots)
+// server.js (Express + Supabase + Cloudinary + OG endpoint para bots)
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
@@ -27,9 +27,8 @@ const supabase = createClient(
 
 // Config
 const PORT = process.env.PORT || 3001;
-const FRONTEND_BUILD_PATH = process.env.FRONTEND_BUILD_PATH || path.join(__dirname, 'build'); // opcional, no necesario si front separado
-const SITE_URL = process.env.SITE_URL || 'https://www.zonamicroondas.com'; // Recomendado poner en env
-const FRONTEND_URL = process.env.FRONTEND_URL || SITE_URL; // por si el frontend tiene otro url
+const FRONTEND_BUILD_PATH = process.env.FRONTEND_BUILD_PATH || path.join(__dirname, 'build'); // Ajusta si tu build está en client/build
+const SITE_URL = process.env.SITE_URL || 'https://www.zonamicroondas.com'; // Recomendado establecer en env
 
 // Middleware
 app.use(cors());
@@ -150,75 +149,9 @@ function renderNewsHtml({ title, summary, image, url, published_at, author, site
 </html>`;
 }
 
-// ----------------- RUTA: /news/:id (detecta bots y redirige usuarios) -----------------
-app.get('/news/:id', async (req, res, next) => {
-  try {
-    const ua = req.get('user-agent') || '';
-    const isBot = isBotUserAgent(ua);
-    const { id } = req.params;
-    const pageUrl = `${FRONTEND_URL.replace(/\/$/, '')}/news/${id}`;
-
-    if (isBot) {
-      // Si es bot, devolvemos HTML con OG tags (no redirigimos)
-      const { data: news, error } = await supabase
-        .from('news')
-        .select(`
-          id,
-          title,
-          subtitle,
-          summary,
-          published_at,
-          canonical_slug,
-          created_at,
-          authors(name),
-          news_images(url, position)
-        `)
-        .eq('id', id)
-        .single();
-
-      if (error || !news) {
-        const notFoundHtml = renderNewsHtml({
-          title: 'Noticia no encontrada',
-          summary: 'La noticia solicitada no existe.',
-          image: `${SITE_URL}/images/default-news.jpg`,
-          url: pageUrl,
-          published_at: '',
-          author: ''
-        });
-        res.set('Content-Type', 'text/html; charset=utf-8');
-        return res.status(404).send(notFoundHtml);
-      }
-
-      let mainImage = null;
-      if (Array.isArray(news.news_images) && news.news_images.length > 0) {
-        const sorted = news.news_images.slice().sort((a, b) => (a.position || 0) - (b.position || 0));
-        mainImage = sorted[0].url;
-      }
-
-      const html = renderNewsHtml({
-        title: news.title,
-        summary: news.summary || news.subtitle || '',
-        image: mainImage || `${SITE_URL}/images/default-news.jpg`,
-        url: pageUrl,
-        published_at: news.published_at || news.created_at,
-        author: news.authors?.name || ''
-      });
-
-      res.set('Content-Type', 'text/html; charset=utf-8');
-      res.set('Cache-Control', 'public, max-age=300'); // ajustar si es necesario
-      return res.status(200).send(html);
-    }
-
-    // Si NO es bot -> redirigir al frontend (React) para que el usuario vea la app
-    return res.redirect(302, pageUrl);
-  } catch (err) {
-    console.error('Error en /news/:id:', err);
-    return next(err);
-  }
-});
-
 // ----------------- RUTA DEDICADA: /og/news/:id -----------------
-// Mantenerla por si quieres usarla desde vercel/netlify redirigiendo bots explícitamente
+// Esta ruta devuelve HTML con OG tags que los "scrapers" (Facebook, WhatsApp, etc.) pueden leer.
+// Úsala en las redirecciones desde el hosting del frontend (Vercel/Netlify) para bots.
 app.get('/og/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -244,7 +177,7 @@ app.get('/og/news/:id', async (req, res) => {
         title: 'Noticia no encontrada',
         summary: 'La noticia solicitada no existe.',
         image: `${SITE_URL}/images/default-news.jpg`,
-        url: `${FRONTEND_URL.replace(/\/$/, '')}/news/${id}`,
+        url: `${SITE_URL}/news/${id}`,
         published_at: '',
         author: ''
       });
@@ -259,7 +192,7 @@ app.get('/og/news/:id', async (req, res) => {
       mainImage = sorted[0].url;
     }
 
-    const pageUrl = `${FRONTEND_URL.replace(/\/$/, '')}/news/${news.id}`;
+    const pageUrl = `${SITE_URL}/news/${news.id}`;
 
     const html = renderNewsHtml({
       title: news.title,
@@ -271,6 +204,7 @@ app.get('/og/news/:id', async (req, res) => {
     });
 
     res.set('Content-Type', 'text/html; charset=utf-8');
+    // Pequeño cache para reducir consultas en períodos cortos; ajusta según necesites
     res.set('Cache-Control', 'public, max-age=300');
     return res.status(200).send(html);
   } catch (err) {
@@ -706,7 +640,7 @@ if (fs.existsSync(FRONTEND_BUILD_PATH)) {
 app.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
   console.log(`📡 API disponible en http://localhost:${PORT}/api`);
-  console.log(`🔗 OG endpoint: ${FRONTEND_URL.replace(/\/$/, '')}/og/news/:id`);
+  console.log(`🔗 OG endpoint: ${SITE_URL || 'SITE_URL not set in env'}/og/news/:id`);
 });
 
 process.on('unhandledRejection', (err) => {
