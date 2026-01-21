@@ -1,4 +1,4 @@
-// server.js (Migrado a Supabase) - con slugs automáticos al pedir por id
+// server.js (Migrado a Supabase) - con slugs automáticos al pedir por id + meta tags para bots
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
@@ -18,11 +18,14 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Inicializar Supabase
+// Inicializar Supabase (manteniendo tu forma original)
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
+
+// URL pública de tu app (para construir URLs absolutas de imagenes si son relativas)
+const APP_URL = process.env.APP_URL || 'https://zonamicroondas.com';
 
 // Middleware
 app.use(cors());
@@ -82,6 +85,7 @@ function generateSlug(text) {
 }
 
 // Helper: asegurar slug único, opcionalmente excluyendo un id (para updates)
+// (mantengo tu versión original con while(true) para respetar tu código)
 async function ensureUniqueSlug(baseSlug, excludeId = null) {
   let slug = baseSlug;
   let counter = 0;
@@ -113,7 +117,122 @@ async function ensureUniqueSlug(baseSlug, excludeId = null) {
   }
 }
 
-// ==================== NOTICIAS ====================
+// ----------------- Helpers nuevos para OG/SSR -----------------
+function escapeHtml(text) {
+  if (text === null || text === undefined) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+// Asegura que la URL sea absoluta usando APP_URL si se guardó relativa
+function ensureAbsoluteUrl(url) {
+  if (!url) return null;
+  if (url.startsWith('http://') || url.startsWith('https://')) return url;
+  return `${APP_URL.replace(/\/$/, '')}/${url.replace(/^\//, '')}`;
+}
+
+// Reutilizamos tu función para extract public id (después se usa para borrado)
+function getPublicIdFromCloudinaryUrl(url) {
+  try {
+    const parts = url.split('/');
+    const uploadIndex = parts.findIndex(p => p === 'upload');
+    if (uploadIndex === -1) return null;
+
+    let publicParts = parts.slice(uploadIndex + 1);
+    if (publicParts[0] && /^v\d+$/.test(publicParts[0])) publicParts.shift();
+
+    const last = publicParts.pop();
+    const lastNoExt = last.replace(/\.[^/.]+$/, '');
+    publicParts.push(lastNoExt);
+
+    return publicParts.join('/');
+  } catch (err) {
+    return null;
+  }
+}
+
+// Función para generar HTML con meta tags dinámicos (para bots)
+function generateNewsHTML(newsData, categorySlug) {
+  const title = newsData.title || 'ZONA MICROONDAS';
+  const description = (newsData.summary || 'Noticias de Querétaro').substring(0, 160);
+
+  // Determinar imagen: preferir newsData.images[0].url (news_images), luego newsData.image_url, luego logo
+  let imageUrl = null;
+  if (newsData.images && newsData.images.length > 0 && newsData.images[0].url) {
+    imageUrl = ensureAbsoluteUrl(newsData.images[0].url);
+  } else if (newsData.image_url) {
+    imageUrl = ensureAbsoluteUrl(newsData.image_url);
+  } else {
+    imageUrl = `${APP_URL.replace(/\/$/, '')}/LOGO_ZM.png`;
+  }
+
+  const articleUrl = categorySlug
+    ? `${APP_URL.replace(/\/$/, '')}/${encodeURIComponent(categorySlug)}/articulos/${encodeURIComponent(newsData.canonical_slug)}`
+    : `${APP_URL.replace(/\/$/, '')}/news/${encodeURIComponent(newsData.canonical_slug)}`;
+
+  const publishedDate = newsData.published_at || newsData.created_at || new Date().toISOString();
+  const authorName = newsData.author_name || 'Zona Microondas';
+  const categoryName = newsData.category_name || 'Noticias';
+
+  const safeTitle = escapeHtml(title);
+  const safeDescription = escapeHtml(description);
+  const safeAuthor = escapeHtml(authorName);
+  const safeCategory = escapeHtml(categoryName);
+  const safeImage = escapeHtml(imageUrl);
+
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <link rel="icon" href="/favicon.ico" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#b1121a" />
+  <title>${safeTitle} | ZONA MICROONDAS</title>
+  <meta name="description" content="${safeDescription}" />
+  <meta name="author" content="${safeAuthor}" />
+  <!-- Open Graph -->
+  <meta property="og:type" content="article" />
+  <meta property="og:url" content="${articleUrl}" />
+  <meta property="og:title" content="${safeTitle}" />
+  <meta property="og:description" content="${safeDescription}" />
+  <meta property="og:image" content="${safeImage}" />
+  <meta property="og:image:secure_url" content="${safeImage}" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="${safeTitle}" />
+  <meta property="og:site_name" content="ZONA MICROONDAS" />
+  <meta property="og:locale" content="es_MX" />
+  <meta property="article:published_time" content="${publishedDate}" />
+  <meta property="article:author" content="${safeAuthor}" />
+  <meta property="article:section" content="${safeCategory}" />
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:site" content="@ZONAMICROONDAS" />
+  <meta name="twitter:title" content="${safeTitle}" />
+  <meta name="twitter:description" content="${safeDescription}" />
+  <meta name="twitter:image" content="${safeImage}" />
+  <meta name="twitter:image:alt" content="${safeTitle}" />
+  <link rel="canonical" href="${articleUrl}" />
+</head>
+<body>
+  <noscript>Necesitas habilitar JavaScript para ejecutar esta aplicación.</noscript>
+  <div id="root">
+    <article style="max-width: 800px; margin: 50px auto; padding: 20px; font-family: Arial, sans-serif;">
+      <h1>${safeTitle}</h1>
+      ${imageUrl ? `<img src="${imageUrl}" alt="${safeTitle}" style="width:100%;height:auto;margin:20px 0;" />` : ''}
+      <p style="color:#666; margin: 20px 0; font-size:16px; line-height:1.6;">${safeDescription}</p>
+      <p style="text-align:center;color:#999">Cargando artículo completo...</p>
+    </article>
+  </div>
+</body>
+</html>`;
+}
+
+// ==================== NOTICIAS (tus endpoints originales, sin tocar) ====================
 
 // GET /api/news - Obtener todas las noticias (con filtros opcionales)
 app.get('/api/news', async (req, res) => {
@@ -502,25 +621,6 @@ app.delete('/api/news/:id', async (req, res) => {
 });
 
 // ==================== IMÁGENES DE NOTICIAS ====================
-
-function getPublicIdFromCloudinaryUrl(url) {
-  try {
-    const parts = url.split('/');
-    const uploadIndex = parts.findIndex(p => p === 'upload');
-    if (uploadIndex === -1) return null;
-
-    let publicParts = parts.slice(uploadIndex + 1);
-    if (publicParts[0] && /^v\d+$/.test(publicParts[0])) publicParts.shift();
-
-    const last = publicParts.pop();
-    const lastNoExt = last.replace(/\.[^/.]+$/, '');
-    publicParts.push(lastNoExt);
-
-    return publicParts.join('/');
-  } catch (err) {
-    return null;
-  }
-}
 
 // POST /api/news/:id/images - Subir imagen a una noticia (Cloudinary)
 app.post('/api/news/:id/images', upload.single('image'), async (req, res) => {
@@ -1269,6 +1369,91 @@ app.get('/news/by-id/:id', async (req, res) => {
     }
   } catch (err) {
     console.error(err);
+    res.status(500).send('Error interno');
+  }
+});
+
+// ==================== RUTAS DINÁMICAS PARA META TAGS (SSR ligero para bots) ====================
+// Estas rutas devuelven HTML con meta tags dinámicos para que bots de Facebook/WhatsApp/Twitter lean correctamente.
+// No afectan las rutas /api que tu frontend consume.
+app.get('/:categorySlug/articulos/:slug', async (req, res) => {
+  try {
+    const { slug, categorySlug } = req.params;
+
+    const { data: news, error } = await supabase
+      .from('news')
+      .select(`
+        *,
+        authors(name, email),
+        categories(name, slug)
+      `)
+      .eq('canonical_slug', slug)
+      .single();
+
+    if (error || !news) {
+      // Si no existe, devolvemos 404 simple (no romper la API)
+      return res.status(404).send('Noticia no encontrada');
+    }
+
+    const { data: images } = await supabase
+      .from('news_images')
+      .select('*')
+      .eq('news_id', news.id)
+      .order('position', { ascending: true });
+
+    const newsData = {
+      ...news,
+      author_name: news.authors?.name,
+      author_email: news.authors?.email,
+      category_name: news.categories?.name,
+      category_slug: news.categories?.slug,
+      images: images || []
+    };
+
+    const html = generateNewsHTML(newsData, categorySlug);
+    res.send(html);
+  } catch (error) {
+    console.error('Error en ruta dinámica:', error);
+    res.status(500).send('Error interno');
+  }
+});
+
+app.get('/news/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    const { data: news, error } = await supabase
+      .from('news')
+      .select(`
+        *,
+        authors(name, email),
+        categories(name, slug)
+      `)
+      .eq('canonical_slug', slug)
+      .single();
+
+    if (error || !news) {
+      return res.status(404).send('Noticia no encontrada');
+    }
+
+    const { data: images } = await supabase
+      .from('news_images')
+      .select('*')
+      .eq('news_id', news.id)
+      .order('position', { ascending: true });
+
+    const newsData = {
+      ...news,
+      author_name: news.authors?.name,
+      category_name: news.categories?.name,
+      category_slug: news.categories?.slug,
+      images: images || []
+    };
+
+    const html = generateNewsHTML(newsData, null);
+    res.send(html);
+  } catch (error) {
+    console.error('Error en /news/:slug:', error);
     res.status(500).send('Error interno');
   }
 });
