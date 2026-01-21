@@ -1,4 +1,4 @@
-// server.js (Migrado a Supabase) - con slugs automáticos al pedir por id + meta tags para bots
+// server.js (Migrado a Supabase) - con slugs automáticos al pedir por id + meta tags para bots optimizados para WhatsApp
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
@@ -26,6 +26,9 @@ const supabase = createClient(
 
 // URL pública de tu app (para construir URLs absolutas de imagenes si son relativas)
 const APP_URL = process.env.APP_URL || 'https://zonamicroondas.com';
+
+// Imagen por defecto para fallback
+const DEFAULT_SOCIAL_IMAGE = `${APP_URL}/LOGO_ZM.png`;
 
 // Middleware
 app.use(cors());
@@ -135,6 +138,48 @@ function ensureAbsoluteUrl(url) {
   return `${APP_URL.replace(/\/$/, '')}/${url.replace(/^\//, '')}`;
 }
 
+// FUNCIÓN NUEVA: Optimizar URLs de Cloudinary para WhatsApp/Redes Sociales
+function optimizeCloudinaryUrlForSocial(originalUrl) {
+  if (!originalUrl || !originalUrl.includes('cloudinary.com')) {
+    return originalUrl;
+  }
+  
+  try {
+    // Parsear la URL de Cloudinary
+    // Formato original: https://res.cloudinary.com/dcp1ohnjl/image/upload/v1768964286/news/news-1768964286097-image.jpg
+    
+    // 1. Remover parámetro de versión (v1768964286) - WhatsApp no lo necesita
+    let optimizedUrl = originalUrl.replace(/\/v\d+\//, '/');
+    
+    // 2. Insertar transformaciones específicas para redes sociales
+    // w_1200: ancho 1200px (mínimo recomendado)
+    // h_630: alto 630px (ratio 1.91:1 ideal para Facebook/WhatsApp)
+    // c_fill: recortar para llenar exactamente las dimensiones
+    // f_jpg: forzar formato JPG (WhatsApp prefiere JPG sobre PNG/WEBP)
+    // q_auto: calidad automática optimizada
+    
+    // Solo añadir transformaciones si no las tiene ya
+    if (!optimizedUrl.includes('/w_') && !optimizedUrl.includes('/c_')) {
+      optimizedUrl = optimizedUrl.replace(
+        /\/upload\//,
+        '/upload/w_1200,h_630,c_fill,f_jpg,q_auto/'
+      );
+    }
+    
+    // 3. Asegurar que termine en .jpg (WhatsApp prefiere JPG)
+    optimizedUrl = optimizedUrl.replace(/\.(png|webp|gif)$/i, '.jpg');
+    
+    // 4. Añadir parámetro de cache busting para evitar cache de WhatsApp
+    const timestamp = Math.floor(Date.now() / 60000); // Cambia cada minuto
+    optimizedUrl += (optimizedUrl.includes('?') ? '&' : '?') + `_=${timestamp}`;
+    
+    return optimizedUrl;
+  } catch (error) {
+    console.error('Error optimizing Cloudinary URL:', error);
+    return originalUrl;
+  }
+}
+
 // Reutilizamos tu función para extract public id (después se usa para borrado)
 function getPublicIdFromCloudinaryUrl(url) {
   try {
@@ -155,35 +200,42 @@ function getPublicIdFromCloudinaryUrl(url) {
   }
 }
 
-// Función para generar HTML con meta tags dinámicos (para bots)
+// Función para generar HTML con meta tags dinámicos (para bots) - OPTIMIZADA
 function generateNewsHTML(newsData, categorySlug) {
   const title = newsData.title || 'ZONA MICROONDAS';
   const description = (newsData.summary || 'Noticias de Querétaro').substring(0, 160);
-
-  // Determinar imagen: preferir newsData.images[0].url (news_images), luego newsData.image_url, luego logo
-  let imageUrl = null;
+  
+  // Determinar imagen OPTIMIZADA para redes sociales
+  let imageUrl = DEFAULT_SOCIAL_IMAGE;
+  let originalImageUrl = null;
+  
   if (newsData.images && newsData.images.length > 0 && newsData.images[0].url) {
-    imageUrl = ensureAbsoluteUrl(newsData.images[0].url);
+    originalImageUrl = newsData.images[0].url;
+    imageUrl = optimizeCloudinaryUrlForSocial(originalImageUrl);
   } else if (newsData.image_url) {
-    imageUrl = ensureAbsoluteUrl(newsData.image_url);
-  } else {
-    imageUrl = `${APP_URL.replace(/\/$/, '')}/LOGO_ZM.png`;
+    originalImageUrl = ensureAbsoluteUrl(newsData.image_url);
+    imageUrl = optimizeCloudinaryUrlForSocial(originalImageUrl);
   }
-
+  
+  // Usar la original como fallback si la optimizada falla
+  const fallbackImageUrl = originalImageUrl || DEFAULT_SOCIAL_IMAGE;
+  
   const articleUrl = categorySlug
     ? `${APP_URL.replace(/\/$/, '')}/${encodeURIComponent(categorySlug)}/articulos/${encodeURIComponent(newsData.canonical_slug)}`
     : `${APP_URL.replace(/\/$/, '')}/news/${encodeURIComponent(newsData.canonical_slug)}`;
-
+  
   const publishedDate = newsData.published_at || newsData.created_at || new Date().toISOString();
   const authorName = newsData.author_name || 'Zona Microondas';
   const categoryName = newsData.category_name || 'Noticias';
-
+  
   const safeTitle = escapeHtml(title);
   const safeDescription = escapeHtml(description);
   const safeAuthor = escapeHtml(authorName);
   const safeCategory = escapeHtml(categoryName);
   const safeImage = escapeHtml(imageUrl);
-
+  const safeFallbackImage = escapeHtml(fallbackImageUrl);
+  const safeArticleUrl = escapeHtml(articleUrl);
+  
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -194,38 +246,82 @@ function generateNewsHTML(newsData, categorySlug) {
   <title>${safeTitle} | ZONA MICROONDAS</title>
   <meta name="description" content="${safeDescription}" />
   <meta name="author" content="${safeAuthor}" />
-  <!-- Open Graph -->
+  
+  <!-- Open Graph (Facebook, WhatsApp, LinkedIn) -->
   <meta property="og:type" content="article" />
-  <meta property="og:url" content="${articleUrl}" />
+  <meta property="og:url" content="${safeArticleUrl}" />
   <meta property="og:title" content="${safeTitle}" />
   <meta property="og:description" content="${safeDescription}" />
   <meta property="og:image" content="${safeImage}" />
   <meta property="og:image:secure_url" content="${safeImage}" />
+  <meta property="og:image:url" content="${safeFallbackImage}" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
+  <meta property="og:image:type" content="image/jpeg" />
   <meta property="og:image:alt" content="${safeTitle}" />
   <meta property="og:site_name" content="ZONA MICROONDAS" />
   <meta property="og:locale" content="es_MX" />
   <meta property="article:published_time" content="${publishedDate}" />
   <meta property="article:author" content="${safeAuthor}" />
   <meta property="article:section" content="${safeCategory}" />
-  <!-- Twitter -->
+  
+  <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:site" content="@ZONAMICROONDAS" />
+  <meta name="twitter:creator" content="@ZONAMICROONDAS" />
   <meta name="twitter:title" content="${safeTitle}" />
   <meta name="twitter:description" content="${safeDescription}" />
   <meta name="twitter:image" content="${safeImage}" />
   <meta name="twitter:image:alt" content="${safeTitle}" />
-  <link rel="canonical" href="${articleUrl}" />
+  
+  <!-- WhatsApp específico -->
+  <meta property="og:image:type" content="image/jpeg" />
+  <link rel="image_src" href="${safeImage}" />
+  
+  <!-- Canonical URL -->
+  <link rel="canonical" href="${safeArticleUrl}" />
+  
+  <!-- Schema.org markup para Google -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "NewsArticle",
+    "headline": "${safeTitle}",
+    "description": "${safeDescription}",
+    "image": "${safeImage}",
+    "datePublished": "${publishedDate}",
+    "dateModified": "${publishedDate}",
+    "author": {
+      "@type": "Person",
+      "name": "${safeAuthor}"
+    },
+    "publisher": {
+      "@type": "Organization",
+      "name": "ZONA MICROONDAS",
+      "logo": {
+        "@type": "ImageObject",
+        "url": "${APP_URL}/LOGO_ZM.png"
+      }
+    },
+    "mainEntityOfPage": {
+      "@type": "WebPage",
+      "@id": "${safeArticleUrl}"
+    }
+  }
+  </script>
 </head>
 <body>
   <noscript>Necesitas habilitar JavaScript para ejecutar esta aplicación.</noscript>
   <div id="root">
     <article style="max-width: 800px; margin: 50px auto; padding: 20px; font-family: Arial, sans-serif;">
       <h1>${safeTitle}</h1>
-      ${imageUrl ? `<img src="${imageUrl}" alt="${safeTitle}" style="width:100%;height:auto;margin:20px 0;" />` : ''}
+      ${imageUrl ? `<img src="${imageUrl}" alt="${safeTitle}" style="width:100%;max-width:800px;height:auto;margin:20px 0;" />` : ''}
       <p style="color:#666; margin: 20px 0; font-size:16px; line-height:1.6;">${safeDescription}</p>
-      <p style="text-align:center;color:#999">Cargando artículo completo...</p>
+      <div style="text-align:center; margin:40px 0;">
+        <a href="${safeArticleUrl}" style="background-color:#b1121a;color:white;padding:12px 24px;text-decoration:none;border-radius:4px;font-weight:bold;">
+          Leer artículo completo en ZONA MICROONDAS
+        </a>
+      </div>
     </article>
   </div>
 </body>
@@ -1411,6 +1507,12 @@ app.get('/:categorySlug/articulos/:slug', async (req, res) => {
     };
 
     const html = generateNewsHTML(newsData, categorySlug);
+    
+    // Headers para control de cache (importante para WhatsApp)
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+    res.setHeader('Vary', 'User-Agent');
+    
     res.send(html);
   } catch (error) {
     console.error('Error en ruta dinámica:', error);
@@ -1451,6 +1553,12 @@ app.get('/news/:slug', async (req, res) => {
     };
 
     const html = generateNewsHTML(newsData, null);
+    
+    // Headers para control de cache
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+    res.setHeader('Vary', 'User-Agent');
+    
     res.send(html);
   } catch (error) {
     console.error('Error en /news/:slug:', error);
