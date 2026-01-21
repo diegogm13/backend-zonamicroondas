@@ -1,32 +1,40 @@
-// server.js (Migrado a Supabase) - con slugs automáticos al pedir por id
+// server.js - Versión corregida y mejorada
+require('dotenv').config();
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
-require('dotenv').config();
-
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 
-// Configurar Cloudinary desde .env
+// ----------------------- Configs -----------------------
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn('⚠️  Falta SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env');
+}
+
+const JWT_SECRET = process.env.JWT_SECRET || 'please-change-me';
+if (JWT_SECRET === 'please-change-me') {
+  console.warn('⚠️  Usando JWT_SECRET por defecto. Cambia esto en producción.');
+}
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Inicializar Supabase
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// Middleware
+// ----------------------- Middlewares -----------------------
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // Forzar header JSON UTF-8 solo para rutas /api
@@ -37,16 +45,12 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-// === Multer + CloudinaryStorage ===
+// ----------------------- Multer + Cloudinary Storage -----------------------
 const storage = new CloudinaryStorage({
   cloudinary,
   params: {
     folder: 'news',
     allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif'],
-    public_id: (req, file) => {
-      const baseName = file.originalname.split('.')[0].replace(/\s+/g, '-').toLowerCase();
-      return `news-${Date.now()}-${baseName}`;
-    },
     transformation: [{ quality: 'auto' }]
   }
 });
@@ -66,12 +70,12 @@ const upload = multer({
   fileFilter
 });
 
-// Helper: generar slug "limpio"
+// ----------------------- Helpers -----------------------
 function generateSlug(text) {
   return text
     .toString()
-    .normalize('NFD')               // Normalizar acentos
-    .replace(/[\u0300-\u036f]/g, '')// Eliminar diacríticos
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .trim()
     .replace(/\s+/g, '-')
@@ -81,25 +85,20 @@ function generateSlug(text) {
     .replace(/-+$/, '');
 }
 
-// Helper: asegurar slug único, opcionalmente excluyendo un id (para updates)
-async function ensureUniqueSlug(baseSlug, excludeId = null) {
+async function ensureUniqueSlug(baseSlug, excludeId = null, maxAttempts = 100) {
   let slug = baseSlug;
-  let counter = 0;
-
-  while (true) {
+  for (let counter = 0; counter < maxAttempts; counter++) {
     let query = supabase
       .from('news')
-      .select('id');
-
-    query = query.eq('canonical_slug', slug);
+      .select('id', { count: 'exact' })
+      .eq('canonical_slug', slug)
+      .limit(1);
 
     if (excludeId) {
       query = query.neq('id', excludeId);
     }
 
-    // Ejecutar la consulta
-    const { data: rows, error } = await query.limit(1);
-
+    const { data: rows, error } = await query;
     if (error) {
       throw error;
     }
@@ -108,14 +107,112 @@ async function ensureUniqueSlug(baseSlug, excludeId = null) {
       return slug;
     }
 
-    counter += 1;
-    slug = `${baseSlug}-${counter}`;
+    slug = `${baseSlug}-${counter + 1}`;
+  }
+  throw new Error('No se pudo generar un slug único tras varios intentos');
+}
+
+function escapeHtml(text) {
+  if (text === null || text === undefined) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function getPublicIdFromCloudinaryUrl(url) {
+  try {
+    if (!url) return null;
+    const parts = url.split('/');
+    const uploadIndex = parts.findIndex(p => p === 'upload');
+    if (uploadIndex === -1) return null;
+
+    let publicParts = parts.slice(uploadIndex + 1);
+    // quitar versión si existe
+    if (publicParts[0] && /^v\d+$/.test(publicParts[0])) publicParts.shift();
+
+    const last = publicParts.pop();
+    const lastNoExt = last.replace(/\.[^/.]+$/, '');
+    publicParts.push(lastNoExt);
+
+    return publicParts.join('/');
+  } catch (err) {
+    return null;
   }
 }
 
-// ==================== NOTICIAS ====================
+function generateNewsHTML(newsData, categorySlug) {
+  const title = newsData.title || 'ZONA MICROONDAS';
+  const description = (newsData.summary || 'Noticias de Querétaro').substring(0, 160);
+  const imageUrl = newsData.images?.[0]?.url || 'https://www.zonamicroondas.com/LOGO_ZM.png';
+  const articleUrl = categorySlug
+    ? `https://www.zonamicroondas.com/${categorySlug}/articulos/${newsData.canonical_slug}`
+    : `https://www.zonamicroondas.com/news/${newsData.canonical_slug}`;
 
-// GET /api/news - Obtener todas las noticias (con filtros opcionales)
+  const publishedDate = newsData.published_at || newsData.created_at || new Date().toISOString();
+  const authorName = newsData.author_name || 'Zona Microondas';
+  const categoryName = newsData.category_name || 'Noticias';
+
+  const safeTitle = escapeHtml(title);
+  const safeDescription = escapeHtml(description);
+  const safeAuthor = escapeHtml(authorName);
+  const safeCategory = escapeHtml(categoryName);
+
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <link rel="icon" href="/favicon.ico" />
+  <link rel="apple-touch-icon" href="/logo192.png" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#b1121a" />
+  <title>${safeTitle} | ZONA MICROONDAS</title>
+  <meta name="description" content="${safeDescription}" />
+  <meta name="author" content="${safeAuthor}" />
+  <meta property="og:type" content="article" />
+  <meta property="og:url" content="${articleUrl}" />
+  <meta property="og:title" content="${safeTitle}" />
+  <meta property="og:description" content="${safeDescription}" />
+  <meta property="og:image" content="${imageUrl}" />
+  <meta property="og:image:secure_url" content="${imageUrl}" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="${safeTitle}" />
+  <meta property="og:site_name" content="ZONA MICROONDAS" />
+  <meta property="og:locale" content="es_MX" />
+  <meta property="article:published_time" content="${publishedDate}" />
+  <meta property="article:author" content="${safeAuthor}" />
+  <meta property="article:section" content="${safeCategory}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:site" content="@ZONAMICROONDAS" />
+  <meta name="twitter:title" content="${safeTitle}" />
+  <meta name="twitter:description" content="${safeDescription}" />
+  <meta name="twitter:image" content="${imageUrl}" />
+  <meta name="twitter:image:alt" content="${safeTitle}" />
+  <link rel="canonical" href="${articleUrl}" />
+  <link rel="manifest" href="/manifest.json" />
+</head>
+<body>
+  <noscript>Necesitas habilitar JavaScript para ejecutar esta aplicación.</noscript>
+  <div id="root">
+    <article style="max-width: 800px; margin: 50px auto; padding: 20px; font-family: Arial, sans-serif;">
+      <h1>${safeTitle}</h1>
+      ${imageUrl !== 'https://www.zonamicroondas.com/LOGO_ZM.png' ? `<img src="${imageUrl}" alt="${safeTitle}" style="width: 100%; height: auto; margin: 20px 0;" />` : ''}
+      <p style="color: #666; margin: 20px 0; font-size: 16px; line-height: 1.6;">${safeDescription}</p>
+      <p style="text-align: center; color: #999;">Cargando artículo completo...</p>
+    </article>
+  </div>
+</body>
+</html>`;
+}
+
+// ----------------------- RUTAS / API -----------------------
+
+// --- NEWS API ---
+// Importante: declarar rutas relacionadas con /api primero para evitar colisiones
+// GET /api/news (listar)
 app.get('/api/news', async (req, res) => {
   try {
     const { status, category_id, author_id, is_featured, limit = 50, offset = 0 } = req.query;
@@ -129,18 +226,10 @@ app.get('/api/news', async (req, res) => {
         news_images(url, position)
       `);
 
-    if (status) {
-      query = query.eq('status', status);
-    }
-    if (category_id) {
-      query = query.eq('main_category_id', parseInt(category_id, 10));
-    }
-    if (author_id) {
-      query = query.eq('author_id', parseInt(author_id, 10));
-    }
-    if (typeof is_featured !== 'undefined') {
-      query = query.eq('is_featured', parseInt(is_featured, 10));
-    }
+    if (status) query = query.eq('status', status);
+    if (category_id) query = query.eq('main_category_id', parseInt(category_id, 10));
+    if (author_id) query = query.eq('author_id', parseInt(author_id, 10));
+    if (typeof is_featured !== 'undefined') query = query.eq('is_featured', parseInt(is_featured, 10));
 
     const lim = parseInt(limit, 10) || 50;
     const off = parseInt(offset, 10) || 0;
@@ -151,16 +240,15 @@ app.get('/api/news', async (req, res) => {
       .range(off, off + lim - 1);
 
     const { data, error } = await query;
-
     if (error) throw error;
 
-    const mappedData = data.map(item => ({
+    const mappedData = (data || []).map(item => ({
       ...item,
       author_name: item.authors?.name,
       category_name: item.categories?.name,
       category_slug: item.categories?.slug,
-      image_url: item.news_images?.[0]?.url,
-      canonical_slug: item.canonical_slug // aseguramos enviarlo al frontend
+      image_url: (item.news_images || [])[0]?.url,
+      canonical_slug: item.canonical_slug
     }));
 
     res.json({ success: true, data: mappedData, count: mappedData.length });
@@ -170,90 +258,7 @@ app.get('/api/news', async (req, res) => {
   }
 });
 
-// GET /api/news/:id - Obtener una noticia específica con todas sus relaciones (por id)
-// Si la noticia no tiene canonical_slug, lo generamos, lo guardamos y lo devolvemos.
-app.get('/api/news/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { data: news, error } = await supabase
-      .from('news')
-      .select(`
-        * ,
-        authors(name, email),
-        categories(name, slug)
-      `)
-      .eq('id', id)
-      .single();
-
-    if (error || !news) {
-      return res.status(404).json({ success: false, error: 'Noticia no encontrada' });
-    }
-
-    // Si no tiene canonical_slug, generarlo y actualizar la fila
-    if (!news.canonical_slug) {
-      try {
-        const base = generateSlug(news.title || `news-${news.id}`);
-        const final = await ensureUniqueSlug(base, parseInt(id, 10));
-        const { error: upErr } = await supabase
-          .from('news')
-          .update({ canonical_slug: final })
-          .eq('id', id);
-
-        if (!upErr) {
-          news.canonical_slug = final;
-        } else {
-          console.error('Error al actualizar canonical_slug para id', id, upErr);
-        }
-      } catch (slugErr) {
-        console.error('Error generando slug para noticia id', id, slugErr);
-        // No abortamos: seguimos devolviendo la noticia aunque no se haya guardado el slug
-      }
-    }
-
-    const { data: images } = await supabase
-      .from('news_images')
-      .select('*')
-      .eq('news_id', id)
-      .order('position', { ascending: true });
-
-    const { data: blocks } = await supabase
-      .from('news_blocks')
-      .select('*')
-      .eq('news_id', id)
-      .order('position', { ascending: true });
-
-    const { data: tags } = await supabase
-      .from('news_tags')
-      .select('tags(*)')
-      .eq('news_id', id);
-
-    const { data: related } = await supabase
-      .from('news_related')
-      .select('news(*), relation_type')
-      .eq('news_id', id);
-
-    res.json({
-      success: true,
-      data: {
-        ...news,
-        author_name: news.authors?.name,
-        author_email: news.authors?.email,
-        category_name: news.categories?.name,
-        category_slug: news.categories?.slug,
-        images: images || [],
-        blocks: blocks || [],
-        tags: tags?.map(t => t.tags) || [],
-        related: related || []
-      }
-    });
-  } catch (error) {
-    console.error('GET /api/news/:id error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// GET /api/news/slug/:slug - Obtener noticia por slug
+// GET /api/news/slug/:slug (debe ir antes de /api/news/:id)
 app.get('/api/news/slug/:slug', async (req, res) => {
   try {
     const { slug } = req.params;
@@ -313,7 +318,87 @@ app.get('/api/news/slug/:slug', async (req, res) => {
   }
 });
 
-// POST /api/news - Crear nueva noticia (genera canonical_slug si no llega)
+// GET /api/news/:id (por id)
+app.get('/api/news/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: news, error } = await supabase
+      .from('news')
+      .select(`
+        *,
+        authors(name, email),
+        categories(name, slug)
+      `)
+      .eq('id', id)
+      .single();
+
+    if (error || !news) {
+      return res.status(404).json({ success: false, error: 'Noticia no encontrada' });
+    }
+
+    // Generar slug si hace falta (no abortamos si falla)
+    if (!news.canonical_slug) {
+      try {
+        const base = generateSlug(news.title || `news-${news.id}`);
+        const final = await ensureUniqueSlug(base, parseInt(id, 10));
+        const { error: upErr } = await supabase
+          .from('news')
+          .update({ canonical_slug: final })
+          .eq('id', id);
+
+        if (!upErr) {
+          news.canonical_slug = final;
+        } else {
+          console.error('Error updating canonical_slug for id', id, upErr);
+        }
+      } catch (slugErr) {
+        console.error('Error generating slug for news id', id, slugErr);
+      }
+    }
+
+    const { data: images } = await supabase
+      .from('news_images')
+      .select('*')
+      .eq('news_id', id)
+      .order('position', { ascending: true });
+
+    const { data: blocks } = await supabase
+      .from('news_blocks')
+      .select('*')
+      .eq('news_id', id)
+      .order('position', { ascending: true });
+
+    const { data: tags } = await supabase
+      .from('news_tags')
+      .select('tags(*)')
+      .eq('news_id', id);
+
+    const { data: related } = await supabase
+      .from('news_related')
+      .select('news(*), relation_type')
+      .eq('news_id', id);
+
+    res.json({
+      success: true,
+      data: {
+        ...news,
+        author_name: news.authors?.name,
+        author_email: news.authors?.email,
+        category_name: news.categories?.name,
+        category_slug: news.categories?.slug,
+        images: images || [],
+        blocks: blocks || [],
+        tags: tags?.map(t => t.tags) || [],
+        related: related || []
+      }
+    });
+  } catch (error) {
+    console.error('GET /api/news/:id error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/news
 app.post('/api/news', async (req, res) => {
   try {
     const {
@@ -330,12 +415,9 @@ app.post('/api/news', async (req, res) => {
       blocks = []
     } = req.body;
 
-    // Determinar slug final
-    let finalSlug = canonical_slug;
-    if (finalSlug) {
-      finalSlug = generateSlug(finalSlug);
-      finalSlug = await ensureUniqueSlug(finalSlug);
-    } else if (title) {
+    let finalSlug = canonical_slug ? generateSlug(canonical_slug) : null;
+    if (finalSlug) finalSlug = await ensureUniqueSlug(finalSlug);
+    else if (title) {
       const base = generateSlug(title);
       finalSlug = await ensureUniqueSlug(base);
     }
@@ -343,28 +425,17 @@ app.post('/api/news', async (req, res) => {
     const { data: newsData, error: newsError } = await supabase
       .from('news')
       .insert([{
-        title,
-        subtitle,
-        summary,
-        author_id,
-        main_category_id,
-        status,
-        published_at,
-        is_featured,
-        canonical_slug: finalSlug
+        title, subtitle, summary, author_id, main_category_id, status, published_at, is_featured, canonical_slug: finalSlug
       }])
       .select()
       .single();
 
     if (newsError) throw newsError;
-
     const newsId = newsData.id;
 
     if (tags.length > 0) {
       const tagValues = tags.map(tagId => ({ news_id: newsId, tag_id: tagId }));
-      const { error: tagsError } = await supabase
-        .from('news_tags')
-        .insert(tagValues);
+      const { error: tagsError } = await supabase.from('news_tags').insert(tagValues);
       if (tagsError) throw tagsError;
     }
 
@@ -377,38 +448,24 @@ app.post('/api/news', async (req, res) => {
         alt_text: block.alt_text,
         position: i
       }));
-      const { error: blocksError } = await supabase
-        .from('news_blocks')
-        .insert(blockValues);
+      const { error: blocksError } = await supabase.from('news_blocks').insert(blockValues);
       if (blocksError) throw blocksError;
     }
 
-    res.status(201).json({
-      success: true,
-      data: { id: newsId, canonical_slug: finalSlug, message: 'Noticia creada exitosamente' }
-    });
+    res.status(201).json({ success: true, data: { id: newsId, canonical_slug: finalSlug, message: 'Noticia creada exitosamente' } });
   } catch (error) {
     console.error('POST /api/news error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// PUT /api/news/:id - Actualizar noticia existente (maneja canonical_slug único)
+// PUT /api/news/:id
 app.put('/api/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const {
-      title,
-      subtitle,
-      summary,
-      author_id,
-      main_category_id,
-      status,
-      published_at,
-      is_featured,
-      canonical_slug,
-      tags,
-      blocks
+      title, subtitle, summary, author_id, main_category_id,
+      status, published_at, is_featured, canonical_slug, tags, blocks
     } = req.body;
 
     const updateData = {};
@@ -421,45 +478,28 @@ app.put('/api/news/:id', async (req, res) => {
     if (published_at !== undefined) updateData.published_at = published_at;
     if (is_featured !== undefined) updateData.is_featured = is_featured;
 
-    // Si se envía canonical_slug, procesarlo (slugify + asegurar unicidad, excluyendo este id)
     if (canonical_slug !== undefined) {
       let finalSlug = canonical_slug ? generateSlug(canonical_slug) : null;
-      if (finalSlug) {
-        finalSlug = await ensureUniqueSlug(finalSlug, parseInt(id, 10));
-      }
+      if (finalSlug) finalSlug = await ensureUniqueSlug(finalSlug, parseInt(id, 10));
       updateData.canonical_slug = finalSlug;
     }
 
     if (Object.keys(updateData).length > 0) {
-      const { error: updateError } = await supabase
-        .from('news')
-        .update(updateData)
-        .eq('id', id);
-
+      const { error: updateError } = await supabase.from('news').update(updateData).eq('id', id);
       if (updateError) throw updateError;
     }
 
     if (tags !== undefined) {
-      await supabase
-        .from('news_tags')
-        .delete()
-        .eq('news_id', id);
-
+      await supabase.from('news_tags').delete().eq('news_id', id);
       if (tags.length > 0) {
         const tagValues = tags.map(tagId => ({ news_id: id, tag_id: tagId }));
-        const { error: tagsError } = await supabase
-          .from('news_tags')
-          .insert(tagValues);
+        const { error: tagsError } = await supabase.from('news_tags').insert(tagValues);
         if (tagsError) throw tagsError;
       }
     }
 
     if (blocks !== undefined) {
-      await supabase
-        .from('news_blocks')
-        .delete()
-        .eq('news_id', id);
-
+      await supabase.from('news_blocks').delete().eq('news_id', id);
       if (blocks.length > 0) {
         const blockValues = blocks.map((block, i) => ({
           news_id: id,
@@ -469,9 +509,7 @@ app.put('/api/news/:id', async (req, res) => {
           alt_text: block.alt_text,
           position: i
         }));
-        const { error: blocksError } = await supabase
-          .from('news_blocks')
-          .insert(blockValues);
+        const { error: blocksError } = await supabase.from('news_blocks').insert(blockValues);
         if (blocksError) throw blocksError;
       }
     }
@@ -483,17 +521,12 @@ app.put('/api/news/:id', async (req, res) => {
   }
 });
 
-// DELETE /api/news/:id - Eliminar noticia
+// DELETE /api/news/:id
 app.delete('/api/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { error } = await supabase
-      .from('news')
-      .delete()
-      .eq('id', id);
-
+    const { error } = await supabase.from('news').delete().eq('id', id);
     if (error) throw error;
-
     res.json({ success: true, message: 'Noticia eliminada exitosamente' });
   } catch (error) {
     console.error('DELETE /api/news/:id error:', error);
@@ -501,32 +534,26 @@ app.delete('/api/news/:id', async (req, res) => {
   }
 });
 
-// ==================== IMÁGENES DE NOTICIAS ====================
+// ----------------------- IMÁGENES -----------------------
 
-function getPublicIdFromCloudinaryUrl(url) {
-  try {
-    const parts = url.split('/');
-    const uploadIndex = parts.findIndex(p => p === 'upload');
-    if (uploadIndex === -1) return null;
-
-    let publicParts = parts.slice(uploadIndex + 1);
-    if (publicParts[0] && /^v\d+$/.test(publicParts[0])) publicParts.shift();
-
-    const last = publicParts.pop();
-    const lastNoExt = last.replace(/\.[^/.]+$/, '');
-    publicParts.push(lastNoExt);
-
-    return publicParts.join('/');
-  } catch (err) {
-    return null;
-  }
-}
-
-// POST /api/news/:id/images - Subir imagen a una noticia (Cloudinary)
+// POST /api/news/:id/images - Subir imagen (verifica noticia antes)
 app.post('/api/news/:id/images', upload.single('image'), async (req, res) => {
   try {
     const { id } = req.params;
-    const { caption, alt_text, position = 0 } = req.body;
+    const { caption = null, alt_text = null, position = 0 } = req.body;
+
+    // Verificar que exista la noticia antes de proceder
+    const { data: existingNews, error: newsErr } = await supabase.from('news').select('id').eq('id', parseInt(id, 10)).single();
+    if (newsErr || !existingNews) {
+      // Si multer subió algo, intentar limpiar
+      if (req.file && req.file.path) {
+        const pubId = getPublicIdFromCloudinaryUrl(req.file.path);
+        if (pubId) {
+          try { await cloudinary.uploader.destroy(pubId, { resource_type: 'image' }); } catch (e) { /* ignore */ }
+        }
+      }
+      return res.status(404).json({ success: false, error: 'Noticia no encontrada' });
+    }
 
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No se proporcionó imagen' });
@@ -546,7 +573,14 @@ app.post('/api/news/:id/images', upload.single('image'), async (req, res) => {
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      // limpiar imagen subida en cloudinary si falla el insert
+      const pubId = getPublicIdFromCloudinaryUrl(imageUrl);
+      if (pubId) {
+        try { await cloudinary.uploader.destroy(pubId, { resource_type: 'image' }); } catch (e) { console.error('Error cleaning up cloudinary:', e); }
+      }
+      throw error;
+    }
 
     res.status(201).json({
       success: true,
@@ -562,7 +596,7 @@ app.post('/api/news/:id/images', upload.single('image'), async (req, res) => {
   }
 });
 
-// GET /api/news/:id/images - Obtener todas las imágenes de una noticia
+// GET /api/news/:id/images
 app.get('/api/news/:id/images', async (req, res) => {
   try {
     const { id } = req.params;
@@ -573,7 +607,6 @@ app.get('/api/news/:id/images', async (req, res) => {
       .order('position', { ascending: true });
 
     if (error) throw error;
-
     res.json({ success: true, data: images || [] });
   } catch (error) {
     console.error('GET /api/news/:id/images error:', error);
@@ -581,11 +614,10 @@ app.get('/api/news/:id/images', async (req, res) => {
   }
 });
 
-// DELETE /api/news/:newsId/images/:imageId - Eliminar imagen específica
+// DELETE /api/news/:newsId/images/:imageId
 app.delete('/api/news/:newsId/images/:imageId', async (req, res) => {
   try {
     const { newsId, imageId } = req.params;
-
     const { data: imageData, error: selectError } = await supabase
       .from('news_images')
       .select('*')
@@ -606,11 +638,7 @@ app.delete('/api/news/:newsId/images/:imageId', async (req, res) => {
       }
     }
 
-    const { error: deleteError } = await supabase
-      .from('news_images')
-      .delete()
-      .eq('id', imageId);
-
+    const { error: deleteError } = await supabase.from('news_images').delete().eq('id', imageId);
     if (deleteError) throw deleteError;
 
     res.json({ success: true, message: 'Imagen eliminada exitosamente' });
@@ -620,9 +648,7 @@ app.delete('/api/news/:newsId/images/:imageId', async (req, res) => {
   }
 });
 
-// ==================== CATEGORÍAS ====================
-
-// GET /api/categories
+// ----------------------- CATEGORIES -----------------------
 app.get('/api/categories', async (req, res) => {
   try {
     const { data: categories, error } = await supabase
@@ -636,11 +662,7 @@ app.get('/api/categories', async (req, res) => {
 
     if (error) throw error;
 
-    const mappedData = categories.map(cat => ({
-      ...cat,
-      parent_name: cat.parent?.name
-    }));
-
+    const mappedData = (categories || []).map(cat => ({ ...cat, parent_name: cat.parent?.name }));
     res.json({ success: true, data: mappedData });
   } catch (error) {
     console.error('GET /api/categories error:', error);
@@ -648,99 +670,55 @@ app.get('/api/categories', async (req, res) => {
   }
 });
 
-// POST /api/categories
 app.post('/api/categories', async (req, res) => {
   try {
     const { name, slug, parent_id = null, position = 0, description = null } = req.body;
-
-    if (!name || !slug) {
-      return res.status(400).json({ success: false, error: 'name y slug son obligatorios' });
-    }
+    if (!name || !slug) return res.status(400).json({ success: false, error: 'name y slug son obligatorios' });
 
     if (parent_id !== null && parent_id !== '' && parent_id !== undefined) {
-      const { data: parentData } = await supabase
-        .from('categories')
-        .select('id')
-        .eq('id', parent_id)
-        .single();
-
-      if (!parentData) {
-        return res.status(400).json({ success: false, error: 'parent_id no existe' });
-      }
+      const { data: parentData } = await supabase.from('categories').select('id').eq('id', parent_id).single();
+      if (!parentData) return res.status(400).json({ success: false, error: 'parent_id no existe' });
     }
 
-    const { data: categoryData, error } = await supabase
-      .from('categories')
-      .insert([{
-        name,
-        slug,
-        parent_id: parent_id || null,
-        position,
-        description
-      }])
-      .select()
-      .single();
+    const { data: categoryData, error } = await supabase.from('categories').insert([{
+      name, slug: generateSlug(slug), parent_id: parent_id || null, position, description
+    }]).select().single();
 
     if (error) throw error;
-
-    res.status(201).json({
-      success: true,
-      data: { id: categoryData.id, message: 'Categoría creada exitosamente' }
-    });
+    res.status(201).json({ success: true, data: { id: categoryData.id, message: 'Categoría creada exitosamente' } });
   } catch (error) {
     console.error('POST /api/categories error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// PUT /api/categories/:id
 app.put('/api/categories/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { name, slug, parent_id, position, description } = req.body;
 
-    const { data: existing } = await supabase
-      .from('categories')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (!existing) {
-      return res.status(404).json({ success: false, error: 'Categoría no encontrada' });
-    }
+    const { data: existing } = await supabase.from('categories').select('*').eq('id', id).single();
+    if (!existing) return res.status(404).json({ success: false, error: 'Categoría no encontrada' });
 
     if (parent_id && parseInt(parent_id, 10) === parseInt(id, 10)) {
       return res.status(400).json({ success: false, error: 'parent_id no puede ser igual al id de la categoría' });
     }
 
     if (parent_id !== null && parent_id !== '' && parent_id !== undefined) {
-      const { data: parentData } = await supabase
-        .from('categories')
-        .select('id')
-        .eq('id', parent_id)
-        .single();
-
-      if (!parentData) {
-        return res.status(400).json({ success: false, error: 'parent_id no existe' });
-      }
+      const { data: parentData } = await supabase.from('categories').select('id').eq('id', parent_id).single();
+      if (!parentData) return res.status(400).json({ success: false, error: 'parent_id no existe' });
     }
 
     const updateData = {};
     if (name !== undefined) updateData.name = name;
-    if (slug !== undefined) updateData.slug = slug;
+    if (slug !== undefined) updateData.slug = generateSlug(slug);
     if (parent_id !== undefined) updateData.parent_id = parent_id || null;
     if (position !== undefined) updateData.position = position;
     if (description !== undefined) updateData.description = description;
 
-    if (Object.keys(updateData).length === 0) {
-      return res.status(400).json({ success: false, error: 'No hay campos para actualizar' });
-    }
+    if (Object.keys(updateData).length === 0) return res.status(400).json({ success: false, error: 'No hay campos para actualizar' });
 
-    const { error } = await supabase
-      .from('categories')
-      .update(updateData)
-      .eq('id', id);
-
+    const { error } = await supabase.from('categories').update(updateData).eq('id', id);
     if (error) throw error;
 
     res.json({ success: true, message: 'Categoría actualizada exitosamente' });
@@ -750,45 +728,19 @@ app.put('/api/categories/:id', async (req, res) => {
   }
 });
 
-// DELETE /api/categories/:id
 app.delete('/api/categories/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const { data: existing } = await supabase.from('categories').select('id').eq('id', id).single();
+    if (!existing) return res.status(404).json({ success: false, error: 'Categoría no encontrada' });
 
-    const { data: existing } = await supabase
-      .from('categories')
-      .select('id')
-      .eq('id', id)
-      .single();
+    const { data: children } = await supabase.from('categories').select('id').eq('parent_id', id);
+    if (children && children.length > 0) return res.status(400).json({ success: false, error: 'No se puede eliminar: la categoría tiene subcategorías' });
 
-    if (!existing) {
-      return res.status(404).json({ success: false, error: 'Categoría no encontrada' });
-    }
+    const { data: newsRows } = await supabase.from('news').select('id').eq('main_category_id', id).limit(1);
+    if (newsRows && newsRows.length > 0) return res.status(400).json({ success: false, error: 'No se puede eliminar: la categoría está asociada a noticias' });
 
-    const { data: children } = await supabase
-      .from('categories')
-      .select('id')
-      .eq('parent_id', id);
-
-    if (children && children.length > 0) {
-      return res.status(400).json({ success: false, error: 'No se puede eliminar: la categoría tiene subcategorías' });
-    }
-
-    const { data: newsRows } = await supabase
-      .from('news')
-      .select('id')
-      .eq('main_category_id', id)
-      .limit(1);
-
-    if (newsRows && newsRows.length > 0) {
-      return res.status(400).json({ success: false, error: 'No se puede eliminar: la categoría está asociada a noticias' });
-    }
-
-    const { error } = await supabase
-      .from('categories')
-      .delete()
-      .eq('id', id);
-
+    const { error } = await supabase.from('categories').delete().eq('id', id);
     if (error) throw error;
 
     res.json({ success: true, message: 'Categoría eliminada exitosamente' });
@@ -798,18 +750,11 @@ app.delete('/api/categories/:id', async (req, res) => {
   }
 });
 
-// ==================== AUTORES ====================
-
-// GET /api/authors - Obtener todos los autores
+// ----------------------- AUTHORS -----------------------
 app.get('/api/authors', async (req, res) => {
   try {
-    const { data: authors, error } = await supabase
-      .from('authors')
-      .select('*')
-      .order('name', { ascending: true });
-
+    const { data: authors, error } = await supabase.from('authors').select('*').order('name', { ascending: true });
     if (error) throw error;
-
     res.json({ success: true, data: authors || [] });
   } catch (error) {
     console.error('GET /api/authors error:', error);
@@ -817,21 +762,11 @@ app.get('/api/authors', async (req, res) => {
   }
 });
 
-// GET /api/authors/:id - Obtener un autor específico
 app.get('/api/authors/:id', async (req, res) => {
   try {
     const { id } = req.params;
-
-    const { data: author, error } = await supabase
-      .from('authors')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (error || !author) {
-      return res.status(404).json({ success: false, error: 'Autor no encontrado' });
-    }
-
+    const { data: author, error } = await supabase.from('authors').select('*').eq('id', id).single();
+    if (error || !author) return res.status(404).json({ success: false, error: 'Autor no encontrado' });
     res.json({ success: true, data: author });
   } catch (error) {
     console.error('GET /api/authors/:id error:', error);
@@ -839,113 +774,53 @@ app.get('/api/authors/:id', async (req, res) => {
   }
 });
 
-// POST /api/authors - Crear nuevo autor
 app.post('/api/authors', async (req, res) => {
   try {
     const { name, email = null, bio = null } = req.body;
-
-    if (!name) {
-      return res.status(400).json({ success: false, error: 'name es obligatorio' });
-    }
+    if (!name) return res.status(400).json({ success: false, error: 'name es obligatorio' });
 
     const slug = generateSlug(name);
-
-    const { data: existingSlug } = await supabase
-      .from('authors')
-      .select('id')
-      .eq('slug', slug)
-      .limit(1);
+    const { data: existingSlug } = await supabase.from('authors').select('id').eq('slug', slug).limit(1);
 
     let finalSlug = slug;
-    if (existingSlug && existingSlug.length > 0) {
-      finalSlug = `${slug}-${Date.now()}`;
-    }
+    if (existingSlug && existingSlug.length > 0) finalSlug = `${slug}-${Date.now()}`;
 
     if (email) {
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) {
-        return res.status(400).json({ success: false, error: 'El email no tiene un formato válido' });
-      }
+      if (!emailRegex.test(email)) return res.status(400).json({ success: false, error: 'El email no tiene un formato válido' });
 
-      const { data: existingEmail } = await supabase
-        .from('authors')
-        .select('id')
-        .eq('email', email)
-        .limit(1);
-
-      if (existingEmail && existingEmail.length > 0) {
-        return res.status(400).json({ success: false, error: 'Ya existe un autor con ese email' });
-      }
+      const { data: existingEmail } = await supabase.from('authors').select('id').eq('email', email).limit(1);
+      if (existingEmail && existingEmail.length > 0) return res.status(400).json({ success: false, error: 'Ya existe un autor con ese email' });
     }
 
-    const { data: authorData, error } = await supabase
-      .from('authors')
-      .insert([{
-        name,
-        slug: finalSlug,
-        email,
-        bio
-      }])
-      .select()
-      .single();
-
+    const { data: authorData, error } = await supabase.from('authors').insert([{ name, slug: finalSlug, email, bio }]).select().single();
     if (error) throw error;
 
-    res.status(201).json({
-      success: true,
-      data: { id: authorData.id, slug: finalSlug, message: 'Autor creado exitosamente' }
-    });
+    res.status(201).json({ success: true, data: { id: authorData.id, slug: finalSlug, message: 'Autor creado exitosamente' } });
   } catch (error) {
     console.error('POST /api/authors error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// PUT /api/authors/:id - Actualizar autor existente
 app.put('/api/authors/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { name, slug, email, bio } = req.body;
 
-    const { data: existing } = await supabase
-      .from('authors')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (!existing) {
-      return res.status(404).json({ success: false, error: 'Autor no encontrado' });
-    }
+    const { data: existing } = await supabase.from('authors').select('*').eq('id', id).single();
+    if (!existing) return res.status(404).json({ success: false, error: 'Autor no encontrado' });
 
     if (slug !== undefined && slug !== existing.slug) {
-      const { data: slugExists } = await supabase
-        .from('authors')
-        .select('id')
-        .eq('slug', slug)
-        .neq('id', id)
-        .limit(1);
-
-      if (slugExists && slugExists.length > 0) {
-        return res.status(400).json({ success: false, error: 'Ya existe otro autor con ese slug' });
-      }
+      const { data: slugExists } = await supabase.from('authors').select('id').eq('slug', slug).neq('id', id).limit(1);
+      if (slugExists && slugExists.length > 0) return res.status(400).json({ success: false, error: 'Ya existe otro autor con ese slug' });
     }
 
     if (email !== undefined && email !== null && email !== '') {
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) {
-        return res.status(400).json({ success: false, error: 'El email no tiene un formato válido' });
-      }
-
-      const { data: emailExists } = await supabase
-        .from('authors')
-        .select('id')
-        .eq('email', email)
-        .neq('id', id)
-        .limit(1);
-
-      if (emailExists && emailExists.length > 0) {
-        return res.status(400).json({ success: false, error: 'Ya existe otro autor con ese email' });
-      }
+      if (!emailRegex.test(email)) return res.status(400).json({ success: false, error: 'El email no tiene un formato válido' });
+      const { data: emailExists } = await supabase.from('authors').select('id').eq('email', email).neq('id', id).limit(1);
+      if (emailExists && emailExists.length > 0) return res.status(400).json({ success: false, error: 'Ya existe otro autor con ese email' });
     }
 
     const updateData = {};
@@ -954,15 +829,9 @@ app.put('/api/authors/:id', async (req, res) => {
     if (email !== undefined) updateData.email = email || null;
     if (bio !== undefined) updateData.bio = bio;
 
-    if (Object.keys(updateData).length === 0) {
-      return res.status(400).json({ success: false, error: 'No hay campos para actualizar' });
-    }
+    if (Object.keys(updateData).length === 0) return res.status(400).json({ success: false, error: 'No hay campos para actualizar' });
 
-    const { error } = await supabase
-      .from('authors')
-      .update(updateData)
-      .eq('id', id);
-
+    const { error } = await supabase.from('authors').update(updateData).eq('id', id);
     if (error) throw error;
 
     res.json({ success: true, message: 'Autor actualizado exitosamente' });
@@ -972,36 +841,16 @@ app.put('/api/authors/:id', async (req, res) => {
   }
 });
 
-// DELETE /api/authors/:id - Eliminar autor
 app.delete('/api/authors/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const { data: existing } = await supabase.from('authors').select('id').eq('id', id).single();
+    if (!existing) return res.status(404).json({ success: false, error: 'Autor no encontrado' });
 
-    const { data: existing } = await supabase
-      .from('authors')
-      .select('id')
-      .eq('id', id)
-      .single();
+    const { data: newsRows } = await supabase.from('news').select('id').eq('author_id', id).limit(1);
+    if (newsRows && newsRows.length > 0) return res.status(400).json({ success: false, error: 'No se puede eliminar: el autor tiene noticias asociadas' });
 
-    if (!existing) {
-      return res.status(404).json({ success: false, error: 'Autor no encontrado' });
-    }
-
-    const { data: newsRows } = await supabase
-      .from('news')
-      .select('id')
-      .eq('author_id', id)
-      .limit(1);
-
-    if (newsRows && newsRows.length > 0) {
-      return res.status(400).json({ success: false, error: 'No se puede eliminar: el autor tiene noticias asociadas' });
-    }
-
-    const { error } = await supabase
-      .from('authors')
-      .delete()
-      .eq('id', id);
-
+    const { error } = await supabase.from('authors').delete().eq('id', id);
     if (error) throw error;
 
     res.json({ success: true, message: 'Autor eliminado exitosamente' });
@@ -1011,17 +860,11 @@ app.delete('/api/authors/:id', async (req, res) => {
   }
 });
 
-// ==================== TAGS ====================
-
+// ----------------------- TAGS -----------------------
 app.get('/api/tags', async (req, res) => {
   try {
-    const { data: tags, error } = await supabase
-      .from('tags')
-      .select('*')
-      .order('name', { ascending: true });
-
+    const { data: tags, error } = await supabase.from('tags').select('*').order('name', { ascending: true });
     if (error) throw error;
-
     res.json({ success: true, data: tags || [] });
   } catch (error) {
     console.error('GET /api/tags error:', error);
@@ -1032,188 +875,86 @@ app.get('/api/tags', async (req, res) => {
 app.post('/api/tags', async (req, res) => {
   try {
     const { name, slug } = req.body;
-
-    const { data: tagData, error } = await supabase
-      .from('tags')
-      .insert([{ name, slug }])
-      .select()
-      .single();
-
+    const { data: tagData, error } = await supabase.from('tags').insert([{ name, slug: generateSlug(slug || name) }]).select().single();
     if (error) throw error;
-
-    res.status(201).json({
-      success: true,
-      data: { id: tagData.id, message: 'Tag creado exitosamente' }
-    });
+    res.status(201).json({ success: true, data: { id: tagData.id, message: 'Tag creado exitosamente' } });
   } catch (error) {
     console.error('POST /api/tags error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ==================== AUTENTICACIÓN ====================
-
-// POST /api/auth/login - Iniciar sesión
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Email y contraseña son obligatorios' 
-      });
-    }
-
-    // Buscar usuario por email
-    const { data: user, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .single();
-
-    if (error || !user) {
-      return res.status(401).json({ 
-        success: false, 
-        error: 'Credenciales inválidas' 
-      });
-    }
-
-    // Verificar contraseña (en texto plano - SOLO PARA DESARROLLO)
-    // IMPORTANTE: En producción debes usar bcrypt para hashear contraseñas
-    if (user.password !== password) {
-      return res.status(401).json({ 
-        success: false, 
-        error: 'Credenciales inválidas' 
-      });
-    }
-
-    // Login exitoso - NO devolver la contraseña
-    const { password: _, ...userWithoutPassword } = user;
-
-    res.json({ 
-      success: true, 
-      data: {
-        user: userWithoutPassword,
-        message: 'Login exitoso'
-      }
-    });
-
-  } catch (error) {
-    console.error('POST /api/auth/login error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// POST /api/auth/register - Registrar nuevo usuario (opcional)
+// ----------------------- AUTH (mejorado: bcrypt + JWT) -----------------------
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, name } = req.body;
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña son obligatorios' });
 
-    if (!email || !password) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Email y contraseña son obligatorios' 
-      });
-    }
-
-    // Validar formato de email
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Email inválido' 
-      });
-    }
+    if (!emailRegex.test(email)) return res.status(400).json({ success: false, error: 'Email inválido' });
 
-    // Verificar si el email ya existe
-    const { data: existingUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', email)
-      .single();
+    const { data: existingUser } = await supabase.from('users').select('id').eq('email', email).single();
+    if (existingUser) return res.status(400).json({ success: false, error: 'El email ya está registrado' });
 
-    if (existingUser) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'El email ya está registrado' 
-      });
-    }
-
-    // Crear nuevo usuario
-    // IMPORTANTE: En producción, hashea la contraseña con bcrypt
-    const { data: newUser, error } = await supabase
-      .from('users')
-      .insert([{
-        email,
-        password, // INSEGURO: hashear en producción
-        name: name || email.split('@')[0],
-        role: 'admin'
-      }])
-      .select()
-      .single();
+    const hashed = await bcrypt.hash(password, 10);
+    const { data: newUser, error } = await supabase.from('users').insert([{
+      email, password: hashed, name: name || email.split('@')[0], role: 'admin'
+    }]).select('id, email, name, role, created_at').single();
 
     if (error) throw error;
 
-    const { password: _, ...userWithoutPassword } = newUser;
-
-    res.status(201).json({ 
-      success: true, 
-      data: {
-        user: userWithoutPassword,
-        message: 'Usuario registrado exitosamente'
-      }
-    });
-
+    const token = jwt.sign({ id: newUser.id, email: newUser.email, role: newUser.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.status(201).json({ success: true, data: { user: newUser, token, message: 'Usuario registrado exitosamente' } });
   } catch (error) {
     console.error('POST /api/auth/register error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET /api/auth/verify - Verificar sesión (opcional)
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña son obligatorios' });
+
+    const { data: user, error } = await supabase.from('users').select('id, email, password, name, role').eq('email', email).single();
+    if (error || !user) return res.status(401).json({ success: false, error: 'Credenciales inválidas' });
+
+    const ok = await bcrypt.compare(password, user.password || '');
+    if (!ok) return res.status(401).json({ success: false, error: 'Credenciales inválidas' });
+
+    const { password: _, ...userWithoutPassword } = user;
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({ success: true, data: { user: userWithoutPassword, token, message: 'Login exitoso' } });
+  } catch (error) {
+    console.error('POST /api/auth/login error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/api/auth/verify', async (req, res) => {
   try {
-    const { user_id } = req.query;
+    const token = req.headers.authorization?.split(' ')[1] || req.query.token;
+    if (!token) return res.status(401).json({ success: false, error: 'No autenticado' });
 
-    if (!user_id) {
-      return res.status(401).json({ 
-        success: false, 
-        error: 'No autenticado' 
-      });
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const { data: user, error } = await supabase.from('users').select('id, email, name, role, created_at').eq('id', payload.id).single();
+      if (error || !user) return res.status(401).json({ success: false, error: 'Usuario no encontrado' });
+      res.json({ success: true, data: { user } });
+    } catch (e) {
+      return res.status(401).json({ success: false, error: 'Token inválido' });
     }
-
-    const { data: user, error } = await supabase
-      .from('users')
-      .select('id, email, name, role, created_at')
-      .eq('id', user_id)
-      .single();
-
-    if (error || !user) {
-      return res.status(401).json({ 
-        success: false, 
-        error: 'Usuario no encontrado' 
-      });
-    }
-
-    res.json({ 
-      success: true, 
-      data: { user }
-    });
-
   } catch (error) {
     console.error('GET /api/auth/verify error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ==================== RUTA DE REDIRECCIÓN (opcional) ====================
-// Redirige de /news/by-id/:id a /:categorySlug/articulos/:slug o /news/:slug, 
-// generando slug si hace falta (y actualizando la fila)
+// ----------------------- REDIRECCIÓN (ruta pública) -----------------------
 app.get('/news/by-id/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    // obtener noticia (sin relaciones pesadas)
     const { data: newsRow, error: fetchErr } = await supabase
       .from('news')
       .select('id, title, canonical_slug, main_category_id')
@@ -1225,67 +966,133 @@ app.get('/news/by-id/:id', async (req, res) => {
     }
 
     let slug = newsRow.canonical_slug;
-
-    // si no tiene slug, generarlo y actualizar
     if (!slug) {
       try {
         const base = generateSlug(newsRow.title || `news-${newsRow.id}`);
         const final = await ensureUniqueSlug(base, parseInt(id, 10));
-        const { error: upErr } = await supabase
-          .from('news')
-          .update({ canonical_slug: final })
-          .eq('id', id);
-
-        if (!upErr) {
-          slug = final;
-        } else {
-          console.error('Error actualizando canonical_slug (by-id):', upErr);
-        }
+        const { error: upErr } = await supabase.from('news').update({ canonical_slug: final }).eq('id', id);
+        if (!upErr) slug = final;
       } catch (err) {
         console.error('Error generando slug (by-id):', err);
       }
     }
 
-    // intentar obtener slug de categoría para construir ruta bonita
     let categorySlug = null;
     if (newsRow.main_category_id) {
-      const { data: cat, error: catErr } = await supabase
-        .from('categories')
-        .select('slug')
-        .eq('id', newsRow.main_category_id)
-        .single();
-
+      const { data: cat, error: catErr } = await supabase.from('categories').select('slug').eq('id', newsRow.main_category_id).single();
       if (!catErr && cat) categorySlug = cat.slug;
     }
 
-    if (!slug) {
-      return res.status(404).send('Noticia no encontrada');
-    }
+    if (!slug) return res.status(404).send('Noticia no encontrada');
 
-    if (categorySlug) {
-      return res.redirect(301, `/${encodeURIComponent(categorySlug)}/articulos/${encodeURIComponent(slug)}`);
-    } else {
-      return res.redirect(301, `/news/${encodeURIComponent(slug)}`);
-    }
+    if (categorySlug) return res.redirect(301, `/${encodeURIComponent(categorySlug)}/articulos/${encodeURIComponent(slug)}`);
+    return res.redirect(301, `/news/${encodeURIComponent(slug)}`);
   } catch (err) {
     console.error(err);
     res.status(500).send('Error interno');
   }
 });
 
-// ==================== SERVIDOR ====================
+// ----------------------- SERVIR REACT ESTÁTICO -----------------------
+app.use(express.static(path.join(__dirname, 'build')));
 
+// ----------------------- RUTAS DINÁMICAS PARA META TAGS (SSR ligero) -----------------------
+// Estas rutas son públicas (no /api) y devuelven HTML para bots / OG tags.
+// Deben ir DESPUÉS de app.use(express.static(...)) para priorizar archivos estáticos.
+app.get('/:categorySlug/articulos/:slug', async (req, res) => {
+  try {
+    const { slug, categorySlug } = req.params;
+    console.log(`📄 Petición de noticia: ${categorySlug}/articulos/${slug}`);
+
+    const { data: news, error } = await supabase
+      .from('news')
+      .select(`
+        *,
+        authors(name, email),
+        categories(name, slug)
+      `)
+      .eq('canonical_slug', slug)
+      .single();
+
+    if (error || !news) {
+      console.log(`❌ Noticia no encontrada: ${slug}`);
+      return res.sendFile(path.join(__dirname, 'build', 'index.html'));
+    }
+
+    const { data: images } = await supabase.from('news_images').select('*').eq('news_id', news.id).order('position', { ascending: true });
+
+    const newsData = {
+      ...news,
+      author_name: news.authors?.name,
+      author_email: news.authors?.email,
+      category_name: news.categories?.name,
+      category_slug: news.categories?.slug,
+      images: images || []
+    };
+
+    const html = generateNewsHTML(newsData, categorySlug);
+    res.send(html);
+  } catch (error) {
+    console.error('❌ Error en ruta dinámica:', error);
+    res.sendFile(path.join(__dirname, 'build', 'index.html'));
+  }
+});
+
+app.get('/news/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    console.log(`📄 Petición de noticia: /news/${slug}`);
+
+    const { data: news, error } = await supabase
+      .from('news')
+      .select(`
+        *,
+        authors(name, email),
+        categories(name, slug)
+      `)
+      .eq('canonical_slug', slug)
+      .single();
+
+    if (error || !news) {
+      console.log(`❌ Noticia no encontrada: ${slug}`);
+      return res.sendFile(path.join(__dirname, 'build', 'index.html'));
+    }
+
+    const { data: images } = await supabase.from('news_images').select('*').eq('news_id', news.id).order('position', { ascending: true });
+
+    const newsData = {
+      ...news,
+      author_name: news.authors?.name,
+      category_name: news.categories?.name,
+      category_slug: news.categories?.slug,
+      images: images || []
+    };
+
+    const html = generateNewsHTML(newsData, null);
+    res.send(html);
+  } catch (error) {
+    console.error('❌ Error en ruta /news/:slug:', error);
+    res.sendFile(path.join(__dirname, 'build', 'index.html'));
+  }
+});
+
+// Catch-all: cualquier otra ruta sirve index.html (DEBE IR AL FINAL)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'build', 'index.html'));
+});
+
+// ----------------------- INICIAR SERVIDOR -----------------------
 const PORT = process.env.PORT || 3001;
-
 app.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
   console.log(`📡 API disponible en http://localhost:${PORT}/api`);
+  console.log(`🌐 Sirviendo archivos estáticos de React desde /build`);
 });
 
+// Manejo global de errores no capturados
 process.on('unhandledRejection', (err) => {
   console.error('Error no manejado:', err);
 });
-
 process.on('uncaughtException', (err) => {
   console.error('Exception no capturada:', err);
 });
