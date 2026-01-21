@@ -1458,6 +1458,15 @@ app.get('/news/:slug', async (req, res) => {
   }
 });
 
+// ----------------------- IMPORTANTE: servir estáticos DESPUÉS de las rutas dinámicas -----------------------
+// Servir archivos estáticos (CSS, JS, imágenes) de React (colocado AFTER las rutas dinámicas para no interceptarlas)
+app.use(express.static(path.join(__dirname, 'build')));
+
+// Catch-all: cualquier otra ruta sirve index.html de React (DEBE IR AL FINAL)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'build', 'index.html'));
+});
+
 // ==================== SERVIDOR ====================
 
 const PORT = process.env.PORT || 3001;
