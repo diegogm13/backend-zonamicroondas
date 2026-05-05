@@ -1226,6 +1226,57 @@ app.post('/api/tags', async (req, res) => {
   }
 });
 
+// PUT /api/tags/:id - Actualizar tag
+app.put('/api/tags/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, slug } = req.body;
+
+    if (!name && !slug) {
+      return res.status(400).json({ success: false, error: 'Debes enviar name o slug para actualizar' });
+    }
+
+    const { data: existing } = await supabase.from('tags').select('id').eq('id', id).single();
+    if (!existing) {
+      return res.status(404).json({ success: false, error: 'Tag no encontrado' });
+    }
+
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (slug !== undefined) updateData.slug = slug;
+
+    const { error } = await supabase.from('tags').update(updateData).eq('id', id);
+    if (error) throw error;
+
+    res.json({ success: true, message: 'Tag actualizado exitosamente' });
+  } catch (error) {
+    console.error('PUT /api/tags/:id error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/tags/:id - Eliminar tag
+app.delete('/api/tags/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: existing } = await supabase.from('tags').select('id').eq('id', id).single();
+    if (!existing) {
+      return res.status(404).json({ success: false, error: 'Tag no encontrado' });
+    }
+
+    await supabase.from('news_tags').delete().eq('tag_id', id);
+
+    const { error } = await supabase.from('tags').delete().eq('id', id);
+    if (error) throw error;
+
+    res.json({ success: true, message: 'Tag eliminado exitosamente' });
+  } catch (error) {
+    console.error('DELETE /api/tags/:id error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ==================== AUTENTICACIÓN ====================
 
 // POST /api/auth/login - Iniciar sesión
