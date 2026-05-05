@@ -138,42 +138,24 @@ function ensureAbsoluteUrl(url) {
   return `${APP_URL.replace(/\/$/, '')}/${url.replace(/^\//, '')}`;
 }
 
-// FUNCIÓN NUEVA: Optimizar URLs de Cloudinary para WhatsApp/Redes Sociales
+// Optimizar URLs de Cloudinary para redes sociales
 function optimizeCloudinaryUrlForSocial(originalUrl) {
   if (!originalUrl || !originalUrl.includes('cloudinary.com')) {
     return originalUrl;
   }
-  
+
   try {
-    // Parsear la URL de Cloudinary
-    // Formato original: https://res.cloudinary.com/dcp1ohnjl/image/upload/v1768964286/news/news-1768964286097-image.jpg
-    
-    // 1. Remover parámetro de versión (v1768964286) - WhatsApp no lo necesita
-    let optimizedUrl = originalUrl.replace(/\/v\d+\//, '/');
-    
-    // 2. Insertar transformaciones específicas para redes sociales
-    // w_1200: ancho 1200px (mínimo recomendado)
-    // h_630: alto 630px (ratio 1.91:1 ideal para Facebook/WhatsApp)
-    // c_fill: recortar para llenar exactamente las dimensiones
-    // f_jpg: forzar formato JPG (WhatsApp prefiere JPG sobre PNG/WEBP)
-    // q_auto: calidad automática optimizada
-    
     // Solo añadir transformaciones si no las tiene ya
-    if (!optimizedUrl.includes('/w_') && !optimizedUrl.includes('/c_')) {
-      optimizedUrl = optimizedUrl.replace(
+    if (!originalUrl.includes('/w_') && !originalUrl.includes('/c_')) {
+      // Insertar transformaciones después de /upload/ manteniendo la versión intacta
+      // w_1200,h_630,c_fill: dimensiones ideales para Facebook/WhatsApp (ratio 1.91:1)
+      // f_jpg,q_auto:good: JPG de buena calidad (WhatsApp y Facebook lo prefieren)
+      return originalUrl.replace(
         /\/upload\//,
-        '/upload/w_1200,h_630,c_fill,f_jpg,q_auto/'
+        '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/'
       );
     }
-    
-    // 3. Asegurar que termine en .jpg (WhatsApp prefiere JPG)
-    optimizedUrl = optimizedUrl.replace(/\.(png|webp|gif)$/i, '.jpg');
-    
-    // 4. Añadir parámetro de cache busting para evitar cache de WhatsApp
-    const timestamp = Math.floor(Date.now() / 60000); // Cambia cada minuto
-    optimizedUrl += (optimizedUrl.includes('?') ? '&' : '?') + `_=${timestamp}`;
-    
-    return optimizedUrl;
+    return originalUrl;
   } catch (error) {
     console.error('Error optimizing Cloudinary URL:', error);
     return originalUrl;
@@ -254,7 +236,6 @@ function generateNewsHTML(newsData, categorySlug) {
   <meta property="og:description" content="${safeDescription}" />
   <meta property="og:image" content="${safeImage}" />
   <meta property="og:image:secure_url" content="${safeImage}" />
-  <meta property="og:image:url" content="${safeFallbackImage}" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
   <meta property="og:image:type" content="image/jpeg" />
@@ -264,7 +245,7 @@ function generateNewsHTML(newsData, categorySlug) {
   <meta property="article:published_time" content="${publishedDate}" />
   <meta property="article:author" content="${safeAuthor}" />
   <meta property="article:section" content="${safeCategory}" />
-  
+
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:site" content="@ZONAMICROONDAS" />
@@ -273,9 +254,7 @@ function generateNewsHTML(newsData, categorySlug) {
   <meta name="twitter:description" content="${safeDescription}" />
   <meta name="twitter:image" content="${safeImage}" />
   <meta name="twitter:image:alt" content="${safeTitle}" />
-  
-  <!-- WhatsApp específico -->
-  <meta property="og:image:type" content="image/jpeg" />
+
   <link rel="image_src" href="${safeImage}" />
   
   <!-- Canonical URL -->
