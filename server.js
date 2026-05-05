@@ -312,7 +312,7 @@ function generateNewsHTML(newsData, categorySlug) {
 // GET /api/news - Obtener todas las noticias (con filtros opcionales)
 app.get('/api/news', async (req, res) => {
   try {
-    const { status, category_id, author_id, is_featured, limit = 50, offset = 0 } = req.query;
+    const { status, category_id, author_id, is_featured, limit = 50, offset = 0, include_scheduled } = req.query;
 
     let query = supabase
       .from('news')
@@ -325,6 +325,11 @@ app.get('/api/news', async (req, res) => {
 
     if (status) {
       query = query.eq('status', status);
+      // Si piden publicadas sin el flag de admin, ocultar las programadas (fecha futura)
+      if (status === 'published' && !include_scheduled) {
+        const now = new Date().toISOString();
+        query = query.or(`published_at.is.null,published_at.lte.${now}`);
+      }
     }
     if (category_id) {
       query = query.eq('main_category_id', parseInt(category_id, 10));
