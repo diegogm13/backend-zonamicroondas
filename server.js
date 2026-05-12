@@ -43,6 +43,20 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
+// Auto-publish news whose scheduled time has passed
+async function autoPublishScheduled() {
+  try {
+    const now = new Date().toISOString();
+    await supabase
+      .from('news')
+      .update({ status: 'published' })
+      .eq('status', 'scheduled')
+      .lte('published_at', now);
+  } catch (err) {
+    console.error('autoPublishScheduled error:', err);
+  }
+}
+
 // === Multer + CloudinaryStorage ===
 const storage = new CloudinaryStorage({
   cloudinary,
@@ -312,6 +326,7 @@ function generateNewsHTML(newsData, categorySlug) {
 // GET /api/news - Obtener todas las noticias (con filtros opcionales)
 app.get('/api/news', async (req, res) => {
   try {
+    await autoPublishScheduled();
     const { status, category_id, author_id, is_featured, limit = 50, offset = 0, include_scheduled } = req.query;
 
     let query = supabase
@@ -529,6 +544,15 @@ app.post('/api/news', async (req, res) => {
       blocks = []
     } = req.body;
 
+    // Si published_at es futuro y status='published', forzar 'scheduled'
+    let effectiveStatus = status;
+    if (effectiveStatus === 'published' && published_at) {
+      const pubDate = new Date(published_at);
+      if (!isNaN(pubDate.getTime()) && pubDate > new Date()) {
+        effectiveStatus = 'scheduled';
+      }
+    }
+
     // Determinar slug final
     let finalSlug = canonical_slug;
     if (finalSlug) {
@@ -547,7 +571,7 @@ app.post('/api/news', async (req, res) => {
         summary,
         author_id,
         main_category_id,
-        status,
+        status: effectiveStatus,
         published_at,
         is_featured,
         canonical_slug: finalSlug
@@ -627,6 +651,14 @@ app.put('/api/news/:id', async (req, res) => {
         finalSlug = await ensureUniqueSlug(finalSlug, parseInt(id, 10));
       }
       updateData.canonical_slug = finalSlug;
+    }
+
+    // Si published_at es futuro y status='published', forzar 'scheduled'
+    if (updateData.status === 'published' && updateData.published_at) {
+      const pubDate = new Date(updateData.published_at);
+      if (!isNaN(pubDate.getTime()) && pubDate > new Date()) {
+        updateData.status = 'scheduled';
+      }
     }
 
     if (Object.keys(updateData).length > 0) {
