@@ -328,7 +328,7 @@ app.get('/api/news', async (req, res) => {
       // Si piden publicadas sin el flag de admin, ocultar las programadas (fecha futura)
       if (status === 'published' && !include_scheduled) {
         const now = new Date().toISOString();
-        query = query.or(`published_at.is.null,published_at.lte.${now}`);
+        query = query.lte('published_at', now);
       }
     }
     if (category_id) {
@@ -539,6 +539,8 @@ app.post('/api/news', async (req, res) => {
       finalSlug = await ensureUniqueSlug(base);
     }
 
+    const effectivePublishedAt = published_at || (status === 'published' ? new Date().toISOString() : null);
+
     const { data: newsData, error: newsError } = await supabase
       .from('news')
       .insert([{
@@ -548,7 +550,7 @@ app.post('/api/news', async (req, res) => {
         author_id,
         main_category_id,
         status,
-        published_at,
+        published_at: effectivePublishedAt,
         is_featured,
         canonical_slug: finalSlug
       }])
@@ -617,7 +619,15 @@ app.put('/api/news/:id', async (req, res) => {
     if (author_id !== undefined) updateData.author_id = author_id;
     if (main_category_id !== undefined) updateData.main_category_id = main_category_id;
     if (status !== undefined) updateData.status = status;
-    if (published_at !== undefined) updateData.published_at = published_at;
+    if (published_at !== undefined) {
+      if (published_at) {
+        updateData.published_at = published_at;
+      } else if (status === 'published') {
+        updateData.published_at = new Date().toISOString();
+      } else {
+        updateData.published_at = null;
+      }
+    }
     if (is_featured !== undefined) updateData.is_featured = is_featured;
 
     // Si se envía canonical_slug, procesarlo (slugify + asegurar unicidad, excluyendo este id)
