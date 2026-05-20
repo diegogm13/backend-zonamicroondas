@@ -25,10 +25,10 @@ const supabase = createClient(
 );
 
 // URL pública de tu app (para construir URLs absolutas de imagenes si son relativas)
-const APP_URL = process.env.APP_URL || 'https://zonamicroondas.com';
+const APP_URL = process.env.APP_URL || 'https://www.zonamicroondas.com';
 
 // Imagen por defecto para fallback
-const DEFAULT_SOCIAL_IMAGE = `${APP_URL}/LOGO_ZM.png`;
+const DEFAULT_SOCIAL_IMAGE = 'https://www.zonamicroondas.com/LOGO_ZM.png';
 
 // Middleware
 app.use(cors());
@@ -141,33 +141,25 @@ function ensureAbsoluteUrl(url) {
 // Optimizar URLs de Cloudinary para redes sociales
 function optimizeCloudinaryUrlForSocial(originalUrl) {
   if (!originalUrl || typeof originalUrl !== 'string') {
-    console.log('⚠️ URL inválida, usando default');
     return DEFAULT_SOCIAL_IMAGE;
   }
 
-  // Convertir a URL absoluta si es relativa
-  let absoluteUrl = originalUrl;
-  if (!originalUrl.startsWith('http')) {
-    absoluteUrl = `${APP_URL.replace(/\/$/, '')}/${originalUrl.replace(/^\//, '')}`;
+  // Si ya es URL absoluta, usarla
+  if (originalUrl.startsWith('http')) {
+    // Si no es Cloudinary, devolver la URL original
+    if (!originalUrl.includes('cloudinary.com')) {
+      return originalUrl;
+    }
+    // Si ya tiene transformaciones, devolver como está
+    if (originalUrl.includes('/w_') || originalUrl.includes('/c_') || originalUrl.includes('/f_')) {
+      return originalUrl;
+    }
+    // Agregar transformaciones
+    return originalUrl.replace(/\/upload\//, '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/');
   }
 
-  // Si no es Cloudinary, devolver la URL absoluta
-  if (!absoluteUrl.includes('cloudinary.com')) {
-    return absoluteUrl;
-  }
-
-  // Ya tiene transformaciones, devolver como está
-  if (absoluteUrl.includes('/w_') || absoluteUrl.includes('/c_') || absoluteUrl.includes('/f_')) {
-    return absoluteUrl;
-  }
-
-  // Agregar transformaciones para redes sociales
-  try {
-    return absoluteUrl.replace(/\/upload\//, '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/');
-  } catch (error) {
-    console.error('Error optimizing Cloudinary URL:', error);
-    return absoluteUrl;
-  }
+  // Es URL relativa,直接把默认图片返回
+  return DEFAULT_SOCIAL_IMAGE;
 }
 
   // Si no es Cloudinary, devolver la URL original (o la imagen por defecto)
