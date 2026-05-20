@@ -25,10 +25,10 @@ const supabase = createClient(
 );
 
 // URL pública de tu app (para construir URLs absolutas de imagenes si son relativas)
-const APP_URL = process.env.APP_URL || 'https://www.zonamicroondas.com';
+const APP_URL = process.env.APP_URL || 'https://zonamicroondas.com';
 
 // Imagen por defecto para fallback
-const DEFAULT_SOCIAL_IMAGE = 'https://www.zonamicroondas.com/LOGO_ZM.png';
+const DEFAULT_SOCIAL_IMAGE = `${APP_URL}/LOGO_ZM.png`;
 
 // Middleware
 app.use(cors());
@@ -140,26 +140,26 @@ function ensureAbsoluteUrl(url) {
 
 // Optimizar URLs de Cloudinary para redes sociales
 function optimizeCloudinaryUrlForSocial(originalUrl) {
-  if (!originalUrl || typeof originalUrl !== 'string') {
-    return DEFAULT_SOCIAL_IMAGE;
+  if (!originalUrl || !originalUrl.includes('cloudinary.com')) {
+    return originalUrl;
   }
 
-  // Si ya es URL absoluta, usarla
-  if (originalUrl.startsWith('http')) {
-    // Si no es Cloudinary, devolver la URL original
-    if (!originalUrl.includes('cloudinary.com')) {
-      return originalUrl;
+  try {
+    // Solo añadir transformaciones si no las tiene ya
+    if (!originalUrl.includes('/w_') && !originalUrl.includes('/c_')) {
+      // Insertar transformaciones después de /upload/ manteniendo la versión intacta
+      // w_1200,h_630,c_fill: dimensiones ideales para Facebook/WhatsApp (ratio 1.91:1)
+      // f_jpg,q_auto:good: JPG de buena calidad (WhatsApp y Facebook lo prefieren)
+      return originalUrl.replace(
+        /\/upload\//,
+        '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/'
+      );
     }
-    // Si ya tiene transformaciones, devolver como está
-    if (originalUrl.includes('/w_') || originalUrl.includes('/c_') || originalUrl.includes('/f_')) {
-      return originalUrl;
-    }
-    // Agregar transformaciones
-    return originalUrl.replace(/\/upload\//, '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/');
+    return originalUrl;
+  } catch (error) {
+    console.error('Error optimizing Cloudinary URL:', error);
+    return originalUrl;
   }
-
-  // Es URL relativa
-  return DEFAULT_SOCIAL_IMAGE;
 }
 
 // Reutilizamos tu función para extract public id (después se usa para borrado)
@@ -539,8 +539,6 @@ app.post('/api/news', async (req, res) => {
       finalSlug = await ensureUniqueSlug(base);
     }
 
-    const effectivePublishedAt = published_at || (status === 'published' ? new Date().toISOString() : null);
-
     const { data: newsData, error: newsError } = await supabase
       .from('news')
       .insert([{
@@ -550,7 +548,7 @@ app.post('/api/news', async (req, res) => {
         author_id,
         main_category_id,
         status,
-        published_at: effectivePublishedAt,
+        published_at,
         is_featured,
         canonical_slug: finalSlug
       }])
@@ -619,15 +617,7 @@ app.put('/api/news/:id', async (req, res) => {
     if (author_id !== undefined) updateData.author_id = author_id;
     if (main_category_id !== undefined) updateData.main_category_id = main_category_id;
     if (status !== undefined) updateData.status = status;
-    if (published_at !== undefined) {
-      if (published_at) {
-        updateData.published_at = published_at;
-      } else if (status === 'published') {
-        updateData.published_at = new Date().toISOString();
-      } else {
-        updateData.published_at = null;
-      }
-    }
+    if (published_at !== undefined) updateData.published_at = published_at;
     if (is_featured !== undefined) updateData.is_featured = is_featured;
 
     // Si se envía canonical_slug, procesarlo (slugify + asegurar unicidad, excluyendo este id)
