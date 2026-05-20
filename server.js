@@ -140,22 +140,52 @@ function ensureAbsoluteUrl(url) {
 
 // Optimizar URLs de Cloudinary para redes sociales
 function optimizeCloudinaryUrlForSocial(originalUrl) {
-  if (!originalUrl || !originalUrl.includes('cloudinary.com')) {
+  if (!originalUrl || typeof originalUrl !== 'string') {
+    console.log('⚠️ URL inválida, usando default');
+    return DEFAULT_SOCIAL_IMAGE;
+  }
+
+  // Convertir a URL absoluta si es relativa
+  let absoluteUrl = originalUrl;
+  if (!originalUrl.startsWith('http')) {
+    absoluteUrl = `${APP_URL.replace(/\/$/, '')}/${originalUrl.replace(/^\//, '')}`;
+  }
+
+  // Si no es Cloudinary, devolver la URL absoluta
+  if (!absoluteUrl.includes('cloudinary.com')) {
+    return absoluteUrl;
+  }
+
+  // Ya tiene transformaciones, devolver como está
+  if (absoluteUrl.includes('/w_') || absoluteUrl.includes('/c_') || absoluteUrl.includes('/f_')) {
+    return absoluteUrl;
+  }
+
+  // Agregar transformaciones para redes sociales
+  try {
+    return absoluteUrl.replace(/\/upload\//, '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/');
+  } catch (error) {
+    console.error('Error optimizing Cloudinary URL:', error);
+    return absoluteUrl;
+  }
+}
+
+  // Si no es Cloudinary, devolver la URL original (o la imagen por defecto)
+  if (!originalUrl.includes('cloudinary.com')) {
+    return originalUrl || DEFAULT_SOCIAL_IMAGE;
+  }
+
+  // Ya tiene transformaciones, devolver como está
+  if (originalUrl.includes('/w_') || originalUrl.includes('/c_') || originalUrl.includes('/f_')) {
     return originalUrl;
   }
 
+  // Agregar transformaciones para redes sociales
+  // w_1200,h_630,c_fill: dimensiones ideais para Facebook/WhatsApp
+  // f_jpg: forzar JPG (más compatible)
+  // q_auto:good: buena calidad
   try {
-    // Solo añadir transformaciones si no las tiene ya
-    if (!originalUrl.includes('/w_') && !originalUrl.includes('/c_')) {
-      // Insertar transformaciones después de /upload/ manteniendo la versión intacta
-      // w_1200,h_630,c_fill: dimensiones ideales para Facebook/WhatsApp (ratio 1.91:1)
-      // f_jpg,q_auto:good: JPG de buena calidad (WhatsApp y Facebook lo prefieren)
-      return originalUrl.replace(
-        /\/upload\//,
-        '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/'
-      );
-    }
-    return originalUrl;
+    return originalUrl.replace(/\/upload\//, '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/');
   } catch (error) {
     console.error('Error optimizing Cloudinary URL:', error);
     return originalUrl;
