@@ -158,30 +158,8 @@ function optimizeCloudinaryUrlForSocial(originalUrl) {
     return originalUrl.replace(/\/upload\//, '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/');
   }
 
-  // Es URL relativa,直接把默认图片返回
+  // Es URL relativa
   return DEFAULT_SOCIAL_IMAGE;
-}
-
-  // Si no es Cloudinary, devolver la URL original (o la imagen por defecto)
-  if (!originalUrl.includes('cloudinary.com')) {
-    return originalUrl || DEFAULT_SOCIAL_IMAGE;
-  }
-
-  // Ya tiene transformaciones, devolver como está
-  if (originalUrl.includes('/w_') || originalUrl.includes('/c_') || originalUrl.includes('/f_')) {
-    return originalUrl;
-  }
-
-  // Agregar transformaciones para redes sociales
-  // w_1200,h_630,c_fill: dimensiones ideais para Facebook/WhatsApp
-  // f_jpg: forzar JPG (más compatible)
-  // q_auto:good: buena calidad
-  try {
-    return originalUrl.replace(/\/upload\//, '/upload/w_1200,h_630,c_fill,f_jpg,q_auto:good/');
-  } catch (error) {
-    console.error('Error optimizing Cloudinary URL:', error);
-    return originalUrl;
-  }
 }
 
 // Reutilizamos tu función para extract public id (después se usa para borrado)
