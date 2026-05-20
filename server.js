@@ -338,7 +338,8 @@ app.get('/api/news', async (req, res) => {
       query = query.eq('author_id', parseInt(author_id, 10));
     }
     if (typeof is_featured !== 'undefined') {
-      query = query.eq('is_featured', parseInt(is_featured, 10));
+      const featuredVal = parseInt(is_featured, 10);
+      query = query.eq('is_featured', featuredVal ? true : false);
     }
 
     const lim = parseInt(limit, 10) || 50;
@@ -529,6 +530,8 @@ app.post('/api/news', async (req, res) => {
       blocks = []
     } = req.body;
 
+    const featuredBool = is_featured ? true : false;
+
     // Determinar slug final
     let finalSlug = canonical_slug;
     if (finalSlug) {
@@ -549,7 +552,7 @@ app.post('/api/news', async (req, res) => {
         main_category_id,
         status,
         published_at,
-        is_featured,
+        is_featured: featuredBool,
         canonical_slug: finalSlug
       }])
       .select()
@@ -618,7 +621,7 @@ app.put('/api/news/:id', async (req, res) => {
     if (main_category_id !== undefined) updateData.main_category_id = main_category_id;
     if (status !== undefined) updateData.status = status;
     if (published_at !== undefined) updateData.published_at = published_at;
-    if (is_featured !== undefined) updateData.is_featured = is_featured;
+    if (is_featured !== undefined) updateData.is_featured = is_featured ? true : false;
 
     // Si se envía canonical_slug, procesarlo (slugify + asegurar unicidad, excluyendo este id)
     if (canonical_slug !== undefined) {
